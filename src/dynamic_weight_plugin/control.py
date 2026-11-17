@@ -49,11 +49,9 @@ def operation_summary(operation):
         "generation", "strategy", "scheduling", "consistency", "error",
         "error_code", "deadline_stage", "deadline_ns", "drain_timeout_ms",
         "preparation_timeout_ms", "preparing_inference_steps",
+        "slice_count", "phase_count",
     )
-    result = {key: operation[key] for key in scalar if key in operation}
-    result["slice_count"] = len(operation.get("slices", ()))
-    result["phase_count"] = len(operation.get("phases", ()))
-    return deepcopy(result)
+    return deepcopy({key: operation[key] for key in scalar if key in operation})
 
 
 class Controller:
@@ -105,7 +103,8 @@ class Controller:
             "operation_id": str(uuid4()), "target": target, "mode": mode,
             "state": "draining", "drain_timeout_ms": drain_timeout_ms,
             "preparation_timeout_ms": preparation_timeout_ms,
-            "started_ns": monotonic_ns(), "phases": [], **plan,
+            "started_ns": monotonic_ns(), "slice_count": 0, "phase_count": 0,
+            **plan,
         }
         self.latest = operation
         if target == self.current_format:
@@ -116,7 +115,7 @@ class Controller:
         try:
             if mode == "dirty":
                 operation.update(
-                    state="preparing", preparation_started_ns=monotonic_ns(), slices=[],
+                    state="preparing",
                     preparing_inference_steps=0,
                     consistency="mixed_weight_generations_with_existing_kv",
                 )
@@ -155,19 +154,13 @@ class Controller:
             return
         try:
             operation["preparing_inference_steps"] += bool(model_executed)
-            started = monotonic_ns()
             result = self.backend.advance_replacement()
-            operation["slices"].append(
-                {**result, "start_ns": started, "end_ns": monotonic_ns()}
-            )
+            operation["slice_count"] += 1
             self._check_deadline(operation)
-            if len(operation["slices"]) > MAX_PREPARATION_SLICES:
+            if operation["slice_count"] > MAX_PREPARATION_SLICES:
                 raise RuntimeError("Preparation exceeded the bounded slice count")
             if result.get("ready"):
-                operation["phases"].append(
-                    {"name": "prepare", "start_ns": operation["preparation_started_ns"],
-                     "end_ns": monotonic_ns()}
-                )
+                operation["phase_count"] += 1
                 self._drained(operation)
         except Exception as error:
             self._fail(operation, error)
@@ -187,21 +180,13 @@ class Controller:
                 self.backend.assert_drained()
                 operation["drained_ns"] = monotonic_ns()
                 operation["state"] = "preparing"
-                started = monotonic_ns()
                 self._arm_deadline(
                     operation, "preparation", operation["preparation_timeout_ms"]
                 )
-                if operation["strategy"] in {
-                    "decoder_blocks", "native_linears", "native_components"
-                }:
-                    candidate = self.backend.prepare_layerwise(
-                        operation["target"], lambda: self._check_deadline(operation)
-                    )
-                else:
-                    candidate = self.backend.prepare(operation["target"])
-                operation["phases"].append(
-                    {"name": "prepare", "start_ns": started, "end_ns": monotonic_ns()}
+                candidate = self.backend.prepare_components(
+                    operation["target"], lambda: self._check_deadline(operation)
                 )
+                operation["phase_count"] += 1
             self._check_deadline(operation)
             self.backend.precommit(candidate)
             self._check_deadline(operation)
@@ -212,11 +197,8 @@ class Controller:
             return
         try:
             operation["state"] = "committing"
-            started = monotonic_ns()
-            operation["observation"] = self.backend.commit(candidate)
-            operation["phases"].append(
-                {"name": "commit", "start_ns": started, "end_ns": monotonic_ns()}
-            )
+            self.backend.commit(candidate)
+            operation["phase_count"] += 1
             self.current_format = operation["target"]
             self.generation += 1
             self.backend.resume()

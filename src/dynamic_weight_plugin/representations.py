@@ -53,19 +53,15 @@ def initial_representation(model_config):
     raise ValueError("Initial quantization specification is not a reviewed representation")
 
 
-def native_online_inventory():
-    """Native dispatch metadata, not a hardware or dynamic-qualification claim."""
-    from vllm.config.quantization import _ONLINE_SHORTHANDS
-    from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
-    from vllm.model_executor.layers.linear import LinearBase
-    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
-    result = []
-    for name, args in _ONLINE_SHORTHANDS.items():
-        config = OnlineQuantizationConfig(args)
-        methods = {}
-        for kind, cls in (('linear', LinearBase), ('experts', RoutedExperts)):
-            resolved = config.resolve_quant_method_cls(cls, 'component')
-            methods[kind] = resolved[-1].__name__ if resolved else None
-        result.append({'native_recipe': name, 'native_methods': methods,
-                       'hardware_validated': False})
-    return result
+def validate_initial_load_format(model_config, load_config):
+    """Bind the inferred initial representation to native loader dispatch."""
+    initial = initial_representation(model_config)
+    load_format = load_config.load_format
+    if (initial == "nf4") != (load_format == "bitsandbytes"):
+        raise ValueError(
+            "bitsandbytes load format must be used exactly when the initial "
+            "representation is NF4"
+        )
+    if initial != "nf4" and load_format not in ("auto", "safetensors"):
+        raise ValueError("default safetensors loader required initially")
+    return initial

@@ -69,52 +69,41 @@ def inspect_device():
 
 def validate_representation_hardware(target, config=None, device=None):
     """Shared hardware/dependency gate for startup, ALTER and status."""
-    from .compat import runtime_profile, verify_bitsandbytes_runtime, verify_lowbit_runtime
+    from .compat import runtime_profile, verify_bitsandbytes_runtime
+
     profile = runtime_profile()
     if target not in REPRESENTATIONS:
         raise ValueError('Unknown representation: ' + target)
     if target not in profile.get('representations', REPRESENTATIONS):
         raise ValueError(f"vLLM {profile.get('version')} profile does not qualify representation {target}")
-    legacy_lowbit = target in {'mxfp4', 'int2'} and target not in profile.get('additional_online_formats', ())
-    if legacy_lowbit and os.environ.get('DYNAMIC_QUANTIZATION_LOWBIT_EXPERIMENTS') != '1':
-        raise ValueError('MXFP4/INT2 require explicit low-bit experiment opt-in')
     import torch
     with torch.cuda.device(device) if device is not None else nullcontext():
         cc = inspect_device()
-        # The legacy adapter remains frozen. On 0.32 native BF16 and the
-        # operation's native selector decide admission, independently of SM names.
-        if profile.get('admission_contract') != 'native_components' and cc != (8, 9):
-            raise ValueError('outside the explicit GPU candidates for legacy vLLM')
-        result = {'compute_capability': list(cc),
-                  'hardware_status': 'baseline_architecture' if cc == (8, 9) else 'experimental_candidate',
-                  'hardware_qualified': False,
-                  'evidence_scope': 'prior_SM89_laptop_only_not_all_devices' if cc == (8, 9) else 'NOT_RUN_on_target_hardware'}
-        if legacy_lowbit:
-            verify_lowbit_runtime()
+        result = {'compute_capability': list(cc)}
         if target == 'nf4':
             if 'bitsandbytes' not in os.environ.get('VLLM_PLUGINS', '').split(','):
                 raise ValueError('NF4 requires the bitsandbytes general plugin to be enabled')
             verify_bitsandbytes_runtime()
             result['native_probe'] = {'scope': 'pinned_bitsandbytes_dependency_check_not_kernel_execution'}
-        elif profile.get('admission_contract') == 'native_components' and target in {'fp8', 'fp8_per_channel', 'fp8_per_block', 'mxfp4', 'mxfp8'}:
+        elif target in {
+            'fp8', 'fp8_per_channel', 'fp8_per_block', 'mxfp4', 'mxfp8'
+        }:
             from vllm.config import set_current_vllm_config
             with set_current_vllm_config(config) if config is not None else nullcontext():
                 result['native_probe'] = native_kernel_probe(target)
         return result
 
 
-def representation_decision(target, adapter=None, config=None, artifact_registered=False, device=None):
+def representation_decision(target, adapter=None, config=None, device=None):
     """One explainable availability decision, including model/runtime constraints."""
-    from .compat import validate_runtime_model
+    from .compat import validate_runtime_representation
     decision = {'name': target, 'available': False, 'reason': None}
     try:
         if target not in REPRESENTATIONS:
             raise ValueError('Unknown representation: ' + target)
         if adapter is not None and target not in adapter.formats:
             raise ValueError(f'{target} is not reviewed for {adapter.model_type}')
-        validate_runtime_model(getattr(adapter, 'model_type', None), target)
-        if target == 'awq_int4' and not artifact_registered:
-            raise ValueError('Register a verified AWQ artifact at startup')
+        validate_runtime_representation(target)
         decision.update(validate_representation_hardware(target, config, device))
         decision['available'] = True
     except (ValueError, RuntimeError, ImportError, OSError) as exc:
@@ -122,8 +111,8 @@ def representation_decision(target, adapter=None, config=None, artifact_register
     return decision
 
 
-def require_representation(target, adapter, config=None, artifact_registered=False, device=None):
-    decision = representation_decision(target, adapter, config, artifact_registered, device)
+def require_representation(target, adapter, config=None, device=None):
+    decision = representation_decision(target, adapter, config, device)
     if not decision['available']:
         raise ValueError(decision['reason'])
     return decision

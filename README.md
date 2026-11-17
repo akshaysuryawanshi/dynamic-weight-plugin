@@ -1,142 +1,128 @@
 # Dynamic Weight Plugin
 
 Change a running single-GPU vLLM engine between native weight representations.
-
-- **Drain:** finish active requests, replace weights, then resume queued work.
-- **Dirty:** replace one complete native component between engine steps. Requests
-  may span weight generations and retain KV computed by an older generation.
-
-## Admitted compatibility profiles
-
-| vLLM | PyTorch | Transformers | Representations |
-| --- | --- | --- | --- |
-| 0.32.0 | 2.13.0 | 5.19.0 | BF16, FP8 tensor/channel/block, MXFP8, MXFP4 (drain only), NF4 |
-| 0.33.0 | 2.14.0 | 5.20.2 | BF16, FP8 tensor/channel/block, MXFP8, MXFP4 (drain only), NF4 |
-
-Both profiles use Python 3.11 and `cuda-bindings==13.4.4`. These rows describe
-admission gates, not validation of every recipe. The current source passed 20
-focused CPU tests on each exact profile. Startup verifies the exact vLLM version,
-relevant dependency versions, and fingerprints of the native interfaces used by
-the plugin. Availability is still decided on the active GPU by native kernel
-selection, exact component construction, memory admission, and a numerical
-canary. The model configuration and KV cache stay BF16; activation arithmetic
-follows the selected native quantization recipe.
-
-An earlier scoped extraction smoke on each runtime used Qwen3-0.6B, an RTX 3000
-Ada 8 GiB GPU, and the trusted-local writable-source setting described below.
-BF16 to per-tensor FP8 drain preserved an active 384-token request; FP8 to BF16
-dirty interleaved 116 inference steps; the settled BF16 32-token output matched
-the baseline prefix; and missing or wrong bearer tokens returned 401. This smoke
-predates the current optional-format and error-boundary changes.
-
-Additional bounded vLLM 0.33 checks used batch-invariant, eager, single-GPU
-execution on the same model and Ada SM89 GPU. Three greedy 32-token prompts were
-compared with fresh native targets. Block FP8 and MXFP8 matched settled tokens
-and log probabilities after drain and dirty switches and after BF16 restoration.
-MXFP4 selected native Marlin W4A16 and matched after drain and BF16 restoration;
-dirty entry and exit returned 422 without changing status. NF4 settled outputs
-after drain and dirty switches matched a fresh native bitsandbytes target whose
-pinned in-flight loader hardcodes NF4; BF16 restorations matched the BF16
-baseline. Dirty
-requests themselves can span generations and are not equivalence claims. The
-tested MXFP8 path was native Marlin W8A16. These checks do not establish quality,
-throughput, W8A8, W4A4, MoE, other models, or other hardware.
+Drain mode finishes active requests before replacement. Dirty mode replaces one
+complete component between engine steps, so an active request can span weight
+generations and retain KV from an older generation.
 
 ## Install
 
+Use a separate Python 3.11 environment for each supported vLLM release:
+
 ```bash
-cd /path/to/the/prepared/dynamic-weight-plugin-checkout
+cd /path/to/dynamic-weight-plugin
 python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install '.[runtime032]'
 ```
 
-Use `'.[runtime033]'` in a separate environment for vLLM 0.33.0.
+Use `'.[runtime033]'` for vLLM 0.33.0.
 
-## Start vLLM
+## Start
 
-Use an absolute, canonical local path to an unquantized safetensors checkpoint.
-By default the checkpoint and its ancestors must be protected from writes by the
-serving user and other users. The plugin hashes its complete checkpoint inventory
-before native loading, rehashes it afterward, and checks the same file identities
-around every replacement.
+The source must be an absolute, canonical path to an unquantized safetensors
+checkpoint. The selected native model class must have a source fingerprint in
+the matching compatibility profile.
 
 ```bash
-export VLLM_API_KEY='replace-with-a-strong-random-token'
 export VLLM_PLUGINS='dynamic_weight,dynamic_weight_api'
 export VLLM_USE_V2_MODEL_RUNNER=0
 export VLLM_USE_FLASHINFER_SAMPLER=0
 
 vllm serve /srv/models/qwen3-0.6b \
   --served-model-name qwen3-weight \
-  --host 127.0.0.1 --port 8000 --api-key "$VLLM_API_KEY" \
+  --host 127.0.0.1 --port 8000 \
   --distributed-executor-backend uni \
   --no-async-scheduling --no-enable-prefix-caching \
   --no-enable-cumem-allocator --dtype bfloat16 \
   --enforce-eager --compilation-config '{"mode": 0}'
 ```
 
-For NF4 on either runtime, also include `bitsandbytes` in `VLLM_PLUGINS`. A local
-development copy can opt out of protected-path enforcement with
-`DYNAMIC_WEIGHT_ALLOW_WRITABLE_SOURCE=1`; content is still hashed and stat-checked,
-but a process able to rewrite and restore that source is outside this mode's
-protection.
+The plugin adds no authentication. These control routes are intended for a
+trusted operator interface; native vLLM or deployment-level access controls can
+be configured separately.
 
-On 0.33, NF4 admission fingerprints the complete reviewed bitsandbytes
-distribution and plugin payload. On 0.32, it checks the bitsandbytes version and
-fingerprints the reviewed plugin files. Both initialize bitsandbytes before the
-unchanged meta-only constructor guard. A canonical checkpoint must not declare
-prequantized metadata: the native in-flight loader supplies `quant_type='nf4'`
-with compressed statistics. The fresh native reference uses vLLM's
-`bitsandbytes` quantization and load format.
+By default, the checkpoint and its ancestors must be protected from writes by
+the serving user and other users. The plugin hashes the complete checkpoint
+inventory before native loading, rehashes it afterward, and checks the same file
+identities around every replacement. Local development can set
+`DYNAMIC_WEIGHT_ALLOW_WRITABLE_SOURCE=1`; hashing remains active, but a process
+that can rewrite and restore the source is outside that mode's protection.
 
-The native Humming kernel selected by some 0.33 CUDA installations compiles
-through NVRTC. If it cannot find `libnvrtc-builtins.so.13.0`, add that Python
-environment's existing `nvidia/cu13/lib` directory to `LD_LIBRARY_PATH` before
-starting vLLM. This does not require a different kernel or downloaded library.
+For NF4, add `bitsandbytes` to `VLLM_PLUGINS`. The 0.33 profile fingerprints the
+reviewed bitsandbytes runtime payload and plugin files; the 0.32 profile checks
+the bitsandbytes version and fingerprints the plugin files. The native in-flight
+loader quantizes the canonical BF16 source with NF4 and compressed statistics.
 
-## Status and alter
+Some 0.33 CUDA installations select a Humming kernel that compiles through
+NVRTC. If `libnvrtc-builtins.so.13.0` is not found, add that environment's
+existing `nvidia/cu13/lib` directory to `LD_LIBRARY_PATH` before starting vLLM.
 
-The endpoints use vLLM's native bearer-token middleware and require a configured
-API key plus an explicit loopback host.
+## Use
 
 ```bash
-curl -sS http://127.0.0.1:8000/v1/dynamic-weight/status \
-  -H "Authorization: Bearer $VLLM_API_KEY"
+curl -sS http://127.0.0.1:8000/v1/dynamic-weight/status
 
 curl -sS http://127.0.0.1:8000/v1/dynamic-weight/alter \
-  -H "Authorization: Bearer $VLLM_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"target":"fp8","mode":"drain"}'
 
 curl -sS http://127.0.0.1:8000/v1/dynamic-weight/alter \
-  -H "Authorization: Bearer $VLLM_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"target":"bf16","mode":"dirty","preparation_timeout_ms":120000}'
 ```
 
 Poll status until `operation.state` is terminal before another alteration. Only
-the latest volatile operation is retained. Drain and preparation timeouts are
+the latest volatile operation is retained. Drain and preparation deadlines are
 checked at engine-safe boundaries and do not interrupt a native CUDA call.
+
+## Compatibility
+
+| vLLM | PyTorch | Transformers | Admitted representations |
+| --- | --- | --- | --- |
+| 0.32.0 | 2.13.0 | 5.19.0 | BF16, FP8 tensor/channel/block, MXFP8, MXFP4 (drain only), NF4 |
+| 0.33.0 | 2.14.0 | 5.20.2 | BF16, FP8 tensor/channel/block, MXFP8, MXFP4 (drain only), NF4 |
+
+Both profiles use Python 3.11 and `cuda-bindings==13.4.4`. Admission still
+depends on native kernel selection on the active GPU, exact component
+construction, memory admission, and a numerical canary. Model configuration and
+KV remain BF16; activation arithmetic follows the native recipe.
+Startup verifies the exact dependency versions and native interface
+fingerprints in the selected profile and rejects differing builds.
+
+The current source passes 27 focused CPU tests on both exact runtime profiles.
+The November 17 cleanup candidate was also checked on both exact releases with
+eager, batch-invariant Qwen3-0.6B on one Ada SM89 GPU and the trusted-local
+writable-source setting. Unauthenticated routes worked; invalid-schema and MXFP4
+dirty requests returned 422 without changing state; a BF16-to-FP8 drain preserved
+an active 384-token response; BF16 dirty restoration interleaved 116 inference
+steps; and a restored 32-token output matched the BF16 baseline prefix. Native
+checks that predate this cleanup ran on November 16 with the same model and GPU.
+Per-tensor FP8 was exercised on both vLLM releases. On 0.33, block FP8 and MXFP8
+matched three fresh-native 32-token settled outputs after
+drain and dirty switches; MXFP4 Marlin W4A16 matched in drain mode; and
+bitsandbytes NF4 matched a fresh native NF4 target. BF16 restorations matched the
+BF16 baseline. These checks do not establish throughput, broad model or hardware
+coverage, MoE qualification, or equivalence for mixed-generation dirty requests.
 
 ## Mechanism and limits
 
-The plugin asks the native model constructor which components intentionally use
-the target quantizer, including unquantized routers, then reloads complete linear
-or MoE components from the canonical checkpoint. Native aliases, checkpoint
-coverage, conversion workspaces, activation reserve, numerical validation, and
-retired ownership are checked before publication. Dirty mode requires prefix
-caching to be disabled because existing KV may outlive a weight generation, and
-it may change the semantics of a response already being generated. Returning to
-BF16 reloads the original BF16 checkpoint tensors; it does not upcast quantized
-weights.
+The plugin asks the native constructor which linear and MoE components use the
+target quantizer, including routers that intentionally stay unquantized. Before
+replacement starts, it checks aliases, checkpoint coverage, conversion
+workspace, and activation reserve. Each complete component is loaded from the
+original BF16 checkpoint, source-checked, published, and checked for retired
+owners before the next engine boundary. After all components are replaced, a
+numerical canary gates the final configuration commit. Returning to BF16 reloads
+the original tensors; it does not upcast quantized weights.
 
 This is an experimental single-worker, single-GPU V1 plugin. It rejects CUDA
 graphs, async scheduling, distributed execution, sleep mode, weight offload,
-LoRA, speculative decoding, multimodal serving, custom workers/schedulers, and
-remote model code. A failure before publication attempts bounded cleanup and
-resume. Once serving weights have changed, recovery is not promised: any failure
-fences the engine and requires restart.
+LoRA, speculative decoding, multimodal serving, custom workers and schedulers,
+and remote model code. Dirty mode requires prefix caching to be disabled and can
+change the semantics of an active response. Failures before publication attempt
+bounded cleanup and resume; failures after publication fence the engine and
+require restart.
 
 ```bash
 python -m unittest discover -s tests -v
@@ -144,4 +130,4 @@ python -m unittest discover -s tests -v
 
 ## License
 
-[MIT](LICENSE).
+[MIT](LICENSE)

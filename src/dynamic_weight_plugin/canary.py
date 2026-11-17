@@ -5,11 +5,21 @@ All global contexts close before yielding back to the engine thread.
 """
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 from time import monotonic
 
 PREFILL_TOKENS = 4
 MAX_KV_BYTES = 32 * 1024**2
 DEADLINE_SECONDS = 30
+
+
+@dataclass(frozen=True)
+class CanaryPlan:
+    name: str
+    layer: object
+    spec: object
+    group: object
+    scratch_bytes: int
 
 
 def require_finite(tensor, stage):
@@ -54,7 +64,7 @@ def plan_canary(config, allow_bound=False):
         group.kv_cache_spec = spec
         size = 2 * spec.page_size_bytes  # block zero remains unused
         scratch_bytes += size
-        plans.append((name, layer, spec, group, size))
+        plans.append(CanaryPlan(name, layer, spec, group, size))
     if not plans or scratch_bytes > MAX_KV_BYTES:
         raise ValueError("Candidate canary exceeds the private KV budget")
     return plans
@@ -64,17 +74,12 @@ def canary_slices(config, model, allow_bound=False):
     import torch
     from vllm.config import set_current_vllm_config
     from vllm.forward_context import set_forward_context
-    from vllm.model_executor.layers.attention import Attention
     from vllm.utils.torch_utils import set_default_torch_dtype
     from vllm.v1.attention.backend import CommonAttentionMetadata
-    from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
-    from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
     from vllm.v1.kv_cache_interface import (
-        AttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor,
+        KVCacheConfig, KVCacheGroupSpec, KVCacheTensor,
     )
-    from vllm.v1.worker.utils import (
-        AttentionGroup, allocate_kv_cache, prepare_kernel_block_sizes,
-    )
+    from vllm.v1.worker.utils import allocate_kv_cache
 
     started = monotonic()
     device = torch.device(config.device_config.device)
@@ -111,8 +116,13 @@ def canary_slices(config, model, allow_bound=False):
     try:
         with scope():
             plans = plan_canary(config, allow_bound)
-            scratch_bytes = sum(plan[4] for plan in plans)
-            for name, layer, spec, group, size in plans:
+            scratch_bytes = sum(plan.scratch_bytes for plan in plans)
+            for plan in plans:
+                name = plan.name
+                layer = plan.layer
+                spec = plan.spec
+                group = plan.group
+                size = plan.scratch_bytes
                 private = KVCacheConfig(2, [KVCacheTensor(
                     size, [name], size, spec.page_size_bytes,
                 )], [KVCacheGroupSpec([name], spec)])

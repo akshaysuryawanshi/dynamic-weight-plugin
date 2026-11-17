@@ -74,7 +74,14 @@ def verified_load(function):
                 or kwargs.get("model") is not None
                 or hasattr(self, "_dynamic_weight_source")):
             raise ValueError("Dynamic weight requires one complete native checkpoint load")
+        from .representations import validate_initial_load_format
+        from .models import verify_model_config_source
         from .source import CheckpointSnapshot
+
+        validate_initial_load_format(
+            self.vllm_config.model_config, self.vllm_config.load_config
+        )
+        verify_model_config_source(self.vllm_config.model_config)
         allow_writable = os.environ.get("DYNAMIC_WEIGHT_ALLOW_WRITABLE_SOURCE", "0") == "1"
         source = CheckpointSnapshot(
             self.vllm_config.model_config.model, require_protected=not allow_writable)

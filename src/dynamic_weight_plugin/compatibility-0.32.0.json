@@ -63,8 +63,6 @@
     "vllm/model_executor/model_loader/__init__.py": "dc3b882166685d1ac1b06c605ecbb6fdfb8f04470172bf665c60956ecb63bf85",
     "vllm/v1/engine/core_client.py": "386b528a69029507f80a2df4d6df2a4fa6ba2ba811501dc3449ceea58b5cd90a",
     "vllm/v1/fault_tolerance/engine_core_sentinel.py": "606d347a2ad7c43a12659d7875d64449cb7f18e461612969c7f4d01691b93007",
-    "vllm/entrypoints/serve/middleware/authenticate.py": "ceb576aa3c053a5bcf145cfbe3f81def0f7213480c4aa1531fc4c00e32955225",
-    "vllm/entrypoints/serve/middleware/register.py": "cff2d2c00e16f45a942eb1c1ef591834cb58d34ec9eefb3269f9134c4b1087bf",
     "vllm/entrypoints/launchers/app.py": "edb09bc78527440a037fd077b11e98971c7376a9380afe7e918c8c0d1ad88ec2",
     "vllm/entrypoints/launchers/api_server/routers.py": "641fbd7b21eb97c64986bd2ee0c2421366cff0628b27e4083c47d6f5aecb4a77",
     "vllm/plugins/endpoint_plugins/interface.py": "b4acdb222013594d84503bede1fe3f182503f34551a6c2798a8278a93bf36110",
@@ -194,11 +192,7 @@
     "vllm/platforms/interface.py": "637e120fcf2a45b02b81174b7ed4653364e9d16ff0063772f1fdfaf4f8dcd2b6",
     "vllm/model_executor/layers/quantization/utils/w8a8_utils.py": "e5bc69d6952515f5676fc6b7bbf3b63cc95624c53d3bf781d1f45f7e6d4a3eb5",
     "vllm/model_executor/layers/quantization/utils/quant_utils.py": "d25a4290d9b8530e38a073125ca6122b40054583814198eb5c8306adf21263d7",
-    "vllm/model_executor/layers/rotary_embedding/__init__.py": "b0487bc2998033fe5e8007759329728342c8827b1f2d6e55e750abe826513c74",
-    "vllm/entrypoints/serve/exception_handling/register.py": "8a023f5c066a7b1bc291535450c47c62cae9d9747a6f08a48c3431092393af17",
-    "vllm/entrypoints/serve/exception_handling/handlers/http.py": "ae710c07f319f56e105a8d143300b0d1042ab4cdedc437da2c7dd88df21e5a18",
-    "vllm/entrypoints/serve/exception_handling/utils.py": "723214aa4c63418f1d5eb7c1ff2116eca474778576ac7198daa1f39217c17a4f",
-    "vllm/entrypoints/serve/engine/protocol.py": "9d865d7006ed6ede3417f75444f8b5dcd82769165e703b140b45ed639d0c16a4"
+    "vllm/model_executor/layers/rotary_embedding/__init__.py": "b0487bc2998033fe5e8007759329728342c8827b1f2d6e55e750abe826513c74"
   },
   "dependencies": {
     "cuda-bindings": "13.4.4",

@@ -7,6 +7,7 @@ no checkpoint values are read and no target representation is cached.
 
 from collections import defaultdict
 from copy import copy
+from dataclasses import dataclass, field
 from math import prod
 from pathlib import Path
 
@@ -104,7 +105,9 @@ def validate_owners(model, paths):
             if id(module) in modules and not any(path == a or path.startswith(a+'.') for a in aliases):
                 raise ValueError('Shared replacement module: ' + path)
             modules[id(module)] = owner
-    for name, tensor in list(model.named_parameters(remove_duplicate=False)) + list(model.named_buffers(remove_duplicate=False)):
+    owned_tensors = list(model.named_parameters(remove_duplicate=False))
+    owned_tensors += list(model.named_buffers(remove_duplicate=False))
+    for name, tensor in owned_tensors:
         if tensor.is_meta or tensor.numel() == 0:
             continue
         owner = name.rsplit('.', 1)[0]
@@ -171,13 +174,17 @@ def plan_units(model, entries):
         return _plan_units(model, entries)
 
 
-def _plan_units(model, entries):
-    import torch
-    from vllm.model_executor.layers.linear import LinearBase
+@dataclass
+class _LoadTrace:
+    current_source: str | None = None
+    destinations: dict = field(default_factory=lambda: defaultdict(set))
+    loaded_elements: dict = field(default_factory=lambda: defaultdict(int))
+    events: set = field(default_factory=set)
+
+
+def _component_paths(model):
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
-    from vllm.model_executor.model_loader.reload.meta import CopyCounter
-    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-    from .layerwise import retire_block
+    from vllm.model_executor.layers.linear import LinearBase
 
     supported = linear_types()
     paths = {}
@@ -188,59 +195,89 @@ def _plan_units(model, entries):
             paths[name] = module
         elif type(module) is RoutedExperts:
             from .expert_components import validate_experts
+
             validate_experts(model, name, module)
             paths[name] = module
         elif isinstance(module, LinearBase):
-            raise ValueError('Unreviewed native linear component: ' + type(module).__name__)
+            raise ValueError(
+                'Unreviewed native linear component: ' + type(module).__name__
+            )
         elif getattr(module, 'quant_method', None) is not None:
-            from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+            from vllm.model_executor.layers.vocab_parallel_embedding import (
+                VocabParallelEmbedding,
+            )
+
             if not isinstance(module, VocabParallelEmbedding):
-                raise ValueError('Unreviewed quantized component: ' + type(module).__name__)
+                raise ValueError(
+                    'Unreviewed quantized component: ' + type(module).__name__
+                )
     if not paths:
         raise ValueError('No replaceable native components')
     validate_owners(model, paths)
+    return paths
 
+
+def _empty_clone(module):
+    clone = copy(module)
+    clone._parameters = {}
+    clone._buffers = {}
+    clone._modules = {}
+    clone._non_persistent_buffers_set = set(module._non_persistent_buffers_set)
+    return clone
+
+
+def _populate_planning_view(model, view, paths):
+    """Clone retained structure and construct replaceable meta components."""
+    import torch
+
+    probes = {}
+    queue = [(model, view, '')]
+    while queue:
+        old, new, prefix = queue.pop()
+        if hasattr(new, 'quant_config'):
+            new.quant_config = None
+        for kind in ('_parameters', '_buffers'):
+            for name, tensor in getattr(old, kind).items():
+                if tensor is None:
+                    continue
+                value = torch.empty(
+                    tuple(tensor.shape), dtype=tensor.dtype, device='meta'
+                )
+                if kind == '_parameters':
+                    value = torch.nn.Parameter(value, requires_grad=False)
+                getattr(new, kind)[name] = value
+        for name, child in old._modules.items():
+            if child is None:
+                new._modules[name] = None
+                continue
+            path = prefix + '.' + name if prefix else name
+            if path in paths:
+                with torch.device('meta'):
+                    probe = type(child)(**constructor_args(child, None))
+                new._modules[name] = probe
+                probes[path] = probe
+            else:
+                clone = _empty_clone(child)
+                new._modules[name] = clone
+                queue.append((child, clone, path))
+    return probes
+
+
+def _plan_units(model, entries):
+    import torch
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+    from vllm.model_executor.model_loader.reload.meta import CopyCounter
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+    from .layerwise import retire_block
+
+    paths = _component_paths(model)
     # Clone each registered path separately: meta aliases are deliberately not
     # tied, allowing per-source tracing without a skipped-alias completeness
     # check intended for an entire checkpoint. Live aliases were checked above.
-    def empty_clone(module):
-        clone = copy(module)
-        clone._parameters, clone._buffers, clone._modules = {}, {}, {}
-        clone._non_persistent_buffers_set = set(module._non_persistent_buffers_set)
-        return clone
-
-    view = empty_clone(model)
-    queue = [(model, view, '')]
-    probes = {}
-    current = [None]
-    destinations = defaultdict(set)
-    loaded_elements = defaultdict(int)
-    events = set()
+    view = _empty_clone(model)
+    trace = _LoadTrace()
     try:
-        while queue:
-            old, new, prefix = queue.pop()
-            if hasattr(new, 'quant_config'):
-                new.quant_config = None
-            for kind in ('_parameters', '_buffers'):
-                for name, tensor in getattr(old, kind).items():
-                    if tensor is not None:
-                        value = torch.empty(tuple(tensor.shape), dtype=tensor.dtype, device='meta')
-                        if kind == '_parameters':
-                            value = torch.nn.Parameter(value, requires_grad=False)
-                        getattr(new, kind)[name] = value
-            for name, child in old._modules.items():
-                if child is None:
-                    new._modules[name] = None
-                    continue
-                path = prefix + '.' + name if prefix else name
-                if path in paths:
-                    with torch.device('meta'):
-                        probe = type(child)(**constructor_args(child, None))
-                    new._modules[name] = probes[path] = probe
-                else:
-                    clone = empty_clone(child)
-                    new._modules[name] = clone
-                    queue.append((child, clone, path))
+        probes = _populate_planning_view(model, view, paths)
 
         for name, param in view.named_parameters():
             path = name.rsplit('.', 1)[0]
@@ -248,50 +285,77 @@ def _plan_units(model, entries):
             if path not in probes:
                 # Retained tensors are only mapped, never reloaded by ALTER.
                 def retained(param, data, *args, _name=name, **kwargs):
-                    destinations[current[0]].add(('retained', _name))
+                    trace.destinations[trace.current_source].add(('retained', _name))
                 param.weight_loader = retained
                 continue
-            def recorded(param, data=None, *args, _name=name, _path=path, _native=native, **kwargs):
+
+            def recorded(
+                param,
+                data=None,
+                *args,
+                _name=name,
+                _path=path,
+                _native=native,
+                **kwargs,
+            ):
                 keyword_data = data is None and 'loaded_weight' in kwargs
                 if keyword_data:
                     data = kwargs['loaded_weight']
                 shard = getattr(data, 'shard_id', args[0] if args else None)
                 key = (_name, repr(shard), repr(kwargs))
-                if key in events:
+                if key in trace.events:
                     raise ValueError('Duplicate native destination shard: ' + _name)
-                events.add(key)
+                trace.events.add(key)
                 with CopyCounter() as counter:
-                    result = (_native(param, *args, **kwargs) if keyword_data
-                              else _native(param, data, *args, **kwargs))
+                    result = (
+                        _native(param, *args, **kwargs)
+                        if keyword_data
+                        else _native(param, data, *args, **kwargs)
+                    )
                 if counter.copied_numel <= 0:
                     raise ValueError('Native component loader did not copy: ' + _name)
-                loaded_elements[_name] += counter.copied_numel
-                destinations[current[0]].add((_path, _name))
+                trace.loaded_elements[_name] += counter.copied_numel
+                trace.destinations[trace.current_source].add((_path, _name))
                 return result
+
             param.weight_loader = recorded
         for entry in entries:
-            current[0] = entry[1]
+            trace.current_source = entry[1]
             source = torch.empty(entry[3], dtype=torch.bfloat16, device='meta')
             view.load_weights(iter([(entry[1], source)]))
-            if not destinations[entry[1]]:
+            if not trace.destinations[entry[1]]:
                 # Native loaders discard derived rotary tables; no other
                 # ignored checkpoint fields are accepted without review.
-                if not entry[1].endswith(('rotary_emb.inv_freq', 'rotary_emb.cos_cached', 'rotary_emb.sin_cached')):
+                if not entry[1].endswith(
+                    (
+                        'rotary_emb.inv_freq',
+                        'rotary_emb.cos_cached',
+                        'rotary_emb.sin_cached',
+                    )
+                ):
                     raise ValueError('Unaccounted canonical tensor: ' + entry[1])
         for path, probe in probes.items():
             for name, param in probe.named_parameters():
                 key = path + '.' + name
-                if loaded_elements[key] != param.numel():
+                if trace.loaded_elements[key] != param.numel():
                     raise ValueError('Incomplete native component: ' + key)
-        result = [{'path': path, 'entries': [], 'kind': 'experts' if type(probe) is RoutedExperts else 'linear',
-                   'logical_bytes': sum(p.numel()*2 for p in probe.parameters())}
-                  for path, probe in probes.items()]
+        result = [
+            {
+                'path': path,
+                'entries': [],
+                'kind': 'experts' if type(probe) is RoutedExperts else 'linear',
+                'logical_bytes': sum(p.numel() * 2 for p in probe.parameters()),
+            }
+            for path, probe in probes.items()
+        ]
         by_path = {unit['path']: unit for unit in result}
         aliases = registered_aliases(model, paths)
         for unit in result:
-            unit['aliases'] = [alias for alias, path in aliases.items() if path == unit['path']]
+            unit['aliases'] = [
+                alias for alias, path in aliases.items() if path == unit['path']
+            ]
         for entry in entries:
-            owners = {path for path, _ in destinations[entry[1]]}
+            owners = {path for path, _ in trace.destinations[entry[1]]}
             if len(owners) > 1:
                 raise ValueError('Canonical tensor spans replacement owners: ' + entry[1])
             if owners and next(iter(owners)) != 'retained':
@@ -306,11 +370,15 @@ def preflight(backend, target, dirty=False):
     import torch
     from .control import MAX_PREPARATION_SLICES
     from .layerwise import target_bytes
+
     backend._check_source()
     if not hasattr(backend, 'component_plan'):
         from vllm.config import set_current_vllm_config
+
         with torch.inference_mode(), set_current_vllm_config(backend.runner.vllm_config):
-            backend.component_plan = plan_units(backend.runner.model, checkpoint_entries(backend.source))
+            backend.component_plan = plan_units(
+                backend.runner.model, checkpoint_entries(backend.source)
+            )
     units = backend.component_plan
     validate_owners(backend.runner.model, {unit['path'] for unit in units})
     if dirty and backend.engine.vllm_config.cache_config.enable_prefix_caching:
@@ -322,22 +390,33 @@ def preflight(backend, target, dirty=False):
         raise ValueError('Replacement exceeds bounded slice count')
     largest = max(sum(e[2]*4 for e in unit['entries']) for unit in units)
     # The bound is deliberately conservative for newly introduced formats.
-    target_upper = sum(target_bytes(u['entries'], target) if target in {'bf16','fp8','fp8_per_channel','nf4'} else u['logical_bytes'] for u in units)
-    resident = sum(p.numel()*p.element_size() for u in units for p in backend.runner.model.get_submodule(u['path']).parameters())
-    reserve = activation + 256*1024**2 if dirty else 0
+    estimated_sizes = (
+        target_bytes(unit['entries'], target)
+        if target in {'bf16', 'fp8', 'fp8_per_channel', 'nf4'}
+        else unit['logical_bytes']
+        for unit in units
+    )
+    target_upper = sum(estimated_sizes)
+    resident = sum(
+        parameter.numel() * parameter.element_size()
+        for unit in units
+        for parameter in backend.runner.model.get_submodule(
+            unit['path']
+        ).parameters()
+    )
+    reserve = activation + 256 * 1024**2 if dirty else 0
     free, _ = torch.cuda.mem_get_info()
-    cached = torch.cuda.memory_reserved()-torch.cuda.memory_allocated()
+    cached = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
     # Ada's native MXFP8 Torch path simultaneously retains BF16 input, two
     # FP32 element arrays, FP8 output and block-scale vectors. Reserve 12
     # bytes/element (3 * the FP32 source bound), plus the fixed margin below.
     # The generic 8-byte allowance underestimates this path at realistic widths.
     workspace = largest * (3 if target == 'mxfp8' else 2)
-    required = max(0, target_upper-resident) + workspace + 128*1024**2
-    available = free-reserve if dirty else free+cached
+    required = max(0, target_upper - resident) + workspace + 128 * 1024**2
+    available = free - reserve if dirty else free + cached
     if available < required:
-        raise ValueError(f'Insufficient component headroom: need {required}, available {available}')
-    backend.memory_admission = {'mode': 'dirty' if dirty else 'drain', 'strategy': 'native_components',
-        'required_bytes': required, 'available_bytes': available, 'largest_source_unit_bytes': largest,
-        'estimated_target_component_bytes': target_upper, 'serving_reserve_bytes': reserve,
-        'component_count': len(units)}
+        raise ValueError(
+            f'Insufficient component headroom: need {required}, available {available}'
+        )
+    backend.serving_reserve_bytes = reserve
     return units

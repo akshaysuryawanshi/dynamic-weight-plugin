@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import sys
 
+
 @lru_cache(maxsize=3)
 def runtime_profile(vllm_version=None):
     installed = vllm_version or version("vllm")
@@ -17,16 +18,14 @@ def runtime_profile(vllm_version=None):
     return json.loads(path.read_text())
 
 
-def validate_runtime_model(model_type, target):
+def validate_runtime_representation(target):
     profile = runtime_profile()
-    if profile.get("admission_contract") != "native_components" and profile.get("model_types") and model_type not in profile["model_types"]:
-        raise ValueError(f"vLLM {profile['version']} profile does not qualify model type {model_type}")
-    if profile.get("representations") and target not in profile["representations"]:
-        raise ValueError(f"vLLM {profile['version']} profile does not qualify representation {target}")
-    reviewed = (None if profile.get('admission_contract') == 'native_components'
-                else profile.get('model_formats', {}).get(model_type))
-    if reviewed is not None and target not in reviewed:
-        raise ValueError(f'vLLM {profile["version"]} profile does not qualify {model_type}/{target}')
+    if profile.get("admission_contract") != "native_components":
+        raise ValueError("Runtime profile does not use native component admission")
+    if target not in profile["representations"]:
+        raise ValueError(
+            f"vLLM {profile['version']} profile does not qualify representation {target}"
+        )
 
 
 def verify_runtime():
@@ -58,13 +57,8 @@ def _verify_distribution(name, expected):
     if dist.version != expected["version"]:
         raise RuntimeError(f"Expected {name} {expected['version']}, got {dist.version}")
     for name, digest in expected["files"].items():
-        actual = hashlib.sha256(Path(dist.locate_file(name)).read_bytes()).hexdigest()
+        actual = hashlib.sha256(
+            Path(dist.locate_file(name)).read_bytes()
+        ).hexdigest()
         if actual != digest:
             raise RuntimeError(f"Unreviewed adapter dependency: {name}")
-
-
-def verify_lowbit_runtime():
-    expected = runtime_profile()
-    if "humming" not in expected:
-        raise RuntimeError("Low-bit experiments are unavailable on this runtime profile")
-    _verify_distribution("humming-kernels", expected["humming"])

@@ -109,11 +109,11 @@ class CheckpointSnapshot:
         self.content_identity = hashlib.sha256(
             json.dumps(digests, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
-        self.source_bytes = sum(
+        source_bytes = sum(
             identity[2] for name, identity in before.items()
             if name.endswith(".safetensors")
         )
-        if not self.source_bytes:
+        if not source_bytes:
             raise ValueError("Canonical checkpoint has no safetensors weight bytes")
 
     def check(self):
