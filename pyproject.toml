@@ -20,7 +20,7 @@ runtime032 = [
 ]
 runtime033 = [
   "vllm==0.33.0", "torch==2.14.0", "transformers==5.20.2",
-  "cuda-bindings==13.4.4",
+  "cuda-bindings==13.4.4", "bitsandbytes==0.50.2", "vllm-bnb-plugin==0.0.3",
 ]
 
 [project.entry-points."vllm.general_plugins"]

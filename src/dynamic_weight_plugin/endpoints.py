@@ -1,6 +1,7 @@
 """Bearer-authenticated HTTP control through vLLM's native /v1 middleware."""
 
 import asyncio
+import json
 import os
 from typing import Literal
 
@@ -127,7 +128,8 @@ async def _call(registry, engine, method, *args):
         ) from error
     if "control_error" in result:
         error = result["control_error"]
-        raise HTTPException(_ERROR_STATUS[error["code"]], error)
+        detail = json.dumps(error, separators=(",", ":"), ensure_ascii=True)
+        raise HTTPException(_ERROR_STATUS[error["code"]], detail)
     return result
 
 

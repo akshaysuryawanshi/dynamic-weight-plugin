@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,10 +12,12 @@ import httpx
 
 import dynamic_weight_plugin
 from dynamic_weight_plugin.compat import verify_runtime
+from dynamic_weight_plugin import compat
 from dynamic_weight_plugin.adapter import EngineBackend
 from dynamic_weight_plugin.endpoints import DynamicWeightEndpoints
 from dynamic_weight_plugin.plugin import guard
 from vllm.entrypoints.serve.middleware.authenticate import AuthenticationMiddleware
+from vllm.entrypoints.serve.exception_handling.register import init_exception_handler
 
 
 class Core:
@@ -25,6 +28,9 @@ class Core:
         if method == "dynamic_weight_status":
             return {"protocol": 1, "controller_id": "controller", "fatal": None,
                     "restart_required": False, "format": "bf16", "operation": None}
+        if args[:2] == ("mxfp4", "dirty"):
+            return {"control_error": {
+                "code": "invalid_request", "message": "mxfp4 only supports drain mode"}}
         return {"operation": {"operation_id": "operation", "state": "completed",
                               "target": args[0], "mode": args[1]}}
 
@@ -35,6 +41,42 @@ class Client:
 
 
 class PackageSeamTests(unittest.TestCase):
+    def test_successful_bitsandbytes_identity_is_verified_once(self):
+        profile = {
+            "bitsandbytes": {"version": "0.50.2", "files": {}},
+            "bitsandbytes_plugin": {"version": "0.0.3", "files": {}},
+        }
+        compat.verify_bitsandbytes_runtime.cache_clear()
+        try:
+            with (patch.object(compat, "runtime_profile", return_value=profile),
+                  patch.object(compat, "_verify_distribution") as verify,
+                  patch.object(compat, "import_module") as runtime_import):
+                compat.verify_bitsandbytes_runtime()
+                compat.verify_bitsandbytes_runtime()
+            self.assertEqual(verify.call_count, 2)
+            runtime_import.assert_called_once_with("bitsandbytes")
+        finally:
+            compat.verify_bitsandbytes_runtime.cache_clear()
+
+    def test_failed_bitsandbytes_identity_is_retried(self):
+        profile = {
+            "bitsandbytes": {"version": "0.50.2", "files": {}},
+            "bitsandbytes_plugin": {"version": "0.0.3", "files": {}},
+        }
+        compat.verify_bitsandbytes_runtime.cache_clear()
+        try:
+            with (patch.object(compat, "runtime_profile", return_value=profile),
+                  patch.object(compat, "_verify_distribution",
+                               side_effect=[RuntimeError("changed"), None, None]) as verify,
+                  patch.object(compat, "import_module") as runtime_import):
+                with self.assertRaisesRegex(RuntimeError, "changed"):
+                    compat.verify_bitsandbytes_runtime()
+                compat.verify_bitsandbytes_runtime()
+            self.assertEqual(verify.call_count, 3)
+            runtime_import.assert_called_once_with("bitsandbytes")
+        finally:
+            compat.verify_bitsandbytes_runtime.cache_clear()
+
     def test_entry_points_and_exact_runtime_fingerprints(self):
         project = Path(__file__).parents[1]
         data = tomllib.loads((project / "pyproject.toml").read_text())
@@ -51,8 +93,16 @@ class PackageSeamTests(unittest.TestCase):
             "vllm/entrypoints/serve/middleware/register.py",
             "vllm/entrypoints/launchers/app.py",
         }
+        exception_boundary = {
+            "vllm/entrypoints/serve/exception_handling/register.py",
+            "vllm/entrypoints/serve/exception_handling/handlers/http.py",
+            "vllm/entrypoints/serve/exception_handling/utils.py",
+            "vllm/entrypoints/serve/engine/protocol.py",
+        }
         for version in ("0.32.0", "0.33.0"):
             self.assertLessEqual(authentication_boundary,
+                                 runtime_profile(version)["files"].keys())
+            self.assertLessEqual(exception_boundary,
                                  runtime_profile(version)["files"].keys())
         verify_runtime()
 
@@ -74,6 +124,8 @@ class EndpointStartupTests(unittest.IsolatedAsyncioTestCase):
         engine = Client()
         app.state.dynamic_weight_client = engine
         DynamicWeightEndpoints().attach_router(app)
+        app.state.args = SimpleNamespace(log_error_stack=False)
+        init_exception_handler(app)
         transport = httpx.ASGITransport(app=AuthenticationMiddleware(app, ["secret"]))
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             self.assertEqual((await client.get("/v1/dynamic-weight/status")).status_code, 401)
@@ -86,7 +138,7 @@ class EndpointStartupTests(unittest.IsolatedAsyncioTestCase):
                 "/v1/dynamic-weight/alter",
                 headers={"Authorization": "Bearer secret"},
                 json={"target": "fp8", "unexpected": True})
-            self.assertEqual(invalid.status_code, 422)
+            self.assertEqual(invalid.status_code, 400)
             self.assertEqual(engine.engine_core.calls, [])
 
             oversized = await client.post(
@@ -104,6 +156,17 @@ class EndpointStartupTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json()["operation"]["state"], "completed")
             self.assertEqual(engine.engine_core.calls[0][0], "dynamic_weight_alter")
+
+            rejected = await client.post(
+                "/v1/dynamic-weight/alter",
+                headers={"Authorization": "Bearer secret"},
+                json={"target": "mxfp4", "mode": "dirty"})
+            self.assertEqual(rejected.status_code, 422)
+            detail = json.loads(rejected.json()["error"]["message"])
+            self.assertEqual(detail, {
+                "code": "invalid_request",
+                "message": "mxfp4 only supports drain mode",
+            })
 
     def test_guard_raises_before_and_after_engine_work_when_fenced(self):
         class Engine: pass

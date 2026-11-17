@@ -10,23 +10,37 @@ Change a running single-GPU vLLM engine between native weight representations.
 
 | vLLM | PyTorch | Transformers | Representations |
 | --- | --- | --- | --- |
-| 0.32.0 | 2.13.0 | 5.19.0 | BF16, FP8 tensor/channel/block, MXFP8, MXFP4, NF4 |
-| 0.33.0 | 2.14.0 | 5.20.2 | BF16, FP8 tensor/channel |
+| 0.32.0 | 2.13.0 | 5.19.0 | BF16, FP8 tensor/channel/block, MXFP8, MXFP4 (drain only), NF4 |
+| 0.33.0 | 2.14.0 | 5.20.2 | BF16, FP8 tensor/channel/block, MXFP8, MXFP4 (drain only), NF4 |
 
 Both profiles use Python 3.11 and `cuda-bindings==13.4.4`. These rows describe
-admission gates, not validation of every recipe. On each listed runtime, the
-standalone package passed 13 CPU tests and a scoped RTX 3000 Ada 8 GiB smoke
-with Qwen3-0.6B and the trusted-local writable-source setting described below:
+admission gates, not validation of every recipe. The current source passed 20
+focused CPU tests on each exact profile. Startup verifies the exact vLLM version,
+relevant dependency versions, and fingerprints of the native interfaces used by
+the plugin. Availability is still decided on the active GPU by native kernel
+selection, exact component construction, memory admission, and a numerical
+canary. The model configuration and KV cache stay BF16; activation arithmetic
+follows the selected native quantization recipe.
+
+An earlier scoped extraction smoke on each runtime used Qwen3-0.6B, an RTX 3000
+Ada 8 GiB GPU, and the trusted-local writable-source setting described below.
 BF16 to per-tensor FP8 drain preserved an active 384-token request; FP8 to BF16
 dirty interleaved 116 inference steps; the settled BF16 32-token output matched
-the baseline prefix; and missing or wrong bearer tokens returned 401. These
-checks do not establish fresh-native FP8 equivalence, throughput, other recipes,
-other models, or other hardware. Startup verifies the
-exact vLLM version, relevant dependency versions, and fingerprints of the native
-interfaces used by the plugin. Availability is still decided on the active GPU
-by native kernel selection, exact component construction, memory admission, and
-a numerical canary. The model configuration and KV cache stay BF16; activation
-arithmetic follows the selected native quantization recipe.
+the baseline prefix; and missing or wrong bearer tokens returned 401. This smoke
+predates the current optional-format and error-boundary changes.
+
+Additional bounded vLLM 0.33 checks used batch-invariant, eager, single-GPU
+execution on the same model and Ada SM89 GPU. Three greedy 32-token prompts were
+compared with fresh native targets. Block FP8 and MXFP8 matched settled tokens
+and log probabilities after drain and dirty switches and after BF16 restoration.
+MXFP4 selected native Marlin W4A16 and matched after drain and BF16 restoration;
+dirty entry and exit returned 422 without changing status. NF4 settled outputs
+after drain and dirty switches matched a fresh native bitsandbytes target whose
+pinned in-flight loader hardcodes NF4; BF16 restorations matched the BF16
+baseline. Dirty
+requests themselves can span generations and are not equivalence claims. The
+tested MXFP8 path was native Marlin W8A16. These checks do not establish quality,
+throughput, W8A8, W4A4, MoE, other models, or other hardware.
 
 ## Install
 
@@ -62,11 +76,24 @@ vllm serve /srv/models/qwen3-0.6b \
   --enforce-eager --compilation-config '{"mode": 0}'
 ```
 
-For NF4 on 0.32.0, also include `bitsandbytes` in `VLLM_PLUGINS`. A local
+For NF4 on either runtime, also include `bitsandbytes` in `VLLM_PLUGINS`. A local
 development copy can opt out of protected-path enforcement with
 `DYNAMIC_WEIGHT_ALLOW_WRITABLE_SOURCE=1`; content is still hashed and stat-checked,
 but a process able to rewrite and restore that source is outside this mode's
 protection.
+
+On 0.33, NF4 admission fingerprints the complete reviewed bitsandbytes
+distribution and plugin payload. On 0.32, it checks the bitsandbytes version and
+fingerprints the reviewed plugin files. Both initialize bitsandbytes before the
+unchanged meta-only constructor guard. A canonical checkpoint must not declare
+prequantized metadata: the native in-flight loader supplies `quant_type='nf4'`
+with compressed statistics. The fresh native reference uses vLLM's
+`bitsandbytes` quantization and load format.
+
+The native Humming kernel selected by some 0.33 CUDA installations compiles
+through NVRTC. If it cannot find `libnvrtc-builtins.so.13.0`, add that Python
+environment's existing `nvidia/cu13/lib` directory to `LD_LIBRARY_PATH` before
+starting vLLM. This does not require a different kernel or downloaded library.
 
 ## Status and alter
 

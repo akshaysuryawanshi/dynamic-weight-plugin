@@ -2,6 +2,7 @@
 
 import hashlib
 from functools import lru_cache
+from importlib import import_module
 from importlib.metadata import distribution, version
 import json
 from pathlib import Path
@@ -38,11 +39,18 @@ def verify_runtime():
             raise RuntimeError(f"Expected reviewed {name} {reviewed}, got {version(name)}")
 
 
+@lru_cache(maxsize=2)
 def verify_bitsandbytes_runtime():
     expected = runtime_profile()
-    if version("bitsandbytes") != expected["bitsandbytes_version"]:
+    if "bitsandbytes" in expected:
+        _verify_distribution("bitsandbytes", expected["bitsandbytes"])
+    elif version("bitsandbytes") != expected["bitsandbytes_version"]:
         raise RuntimeError(f"Expected bitsandbytes {expected['bitsandbytes_version']}")
     _verify_distribution("vllm-bnb-plugin", expected["bitsandbytes_plugin"])
+    # First import creates bitsandbytes' process-global CPU NF4/FP4 codebooks.
+    # Import before caching success so later calls cannot rely on a
+    # verified-but-never-loaded dependency.
+    import_module("bitsandbytes")
 
 
 def _verify_distribution(name, expected):

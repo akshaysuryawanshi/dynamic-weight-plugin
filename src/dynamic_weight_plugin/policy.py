@@ -4,6 +4,14 @@ from .control import ControlError
 def loading_plan(model_type, current, target, mode):
     if mode not in {"drain", "dirty"}:
         raise ControlError("invalid_request", "mode must be drain or dirty; read capabilities")
+    from .representations import REPRESENTATIONS
+    for name in (current, target):
+        representation = REPRESENTATIONS.get(name)
+        if representation is None:
+            raise ControlError("invalid_request", "Unknown representation: " + name)
+        if mode not in representation.modes:
+            allowed = " or ".join(representation.modes)
+            raise ControlError("invalid_request", f"{name} only supports {allowed} mode")
     from .compat import runtime_profile
     profile = runtime_profile()
     if {current, target} <= set(profile.get('component_formats', ())):

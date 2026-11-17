@@ -5,6 +5,7 @@ accepts the model's (currently None) quantization config. A private meta model
 answers that question without reading weights or constructing another GPU model.
 """
 from copy import deepcopy
+import sys
 from unittest.mock import patch
 
 
@@ -28,6 +29,15 @@ def inspect_policy(live, prototype, quant_config, units):
     return policy
 
 
+def initialize_constructor_runtime(cfg):
+    """Initialize verified optional code before the meta-only constructor."""
+    if cfg.model_config.quantization == 'bitsandbytes':
+        from .compat import verify_bitsandbytes_runtime
+        verify_bitsandbytes_runtime()
+        if 'bitsandbytes' not in sys.modules:
+            raise RuntimeError('Verified bitsandbytes runtime was not initialized')
+
+
 def native_policy(backend, cfg, units):
     import torch
     from torch.utils._python_dispatch import TorchDispatchMode
@@ -36,6 +46,10 @@ def native_policy(backend, cfg, units):
     from vllm.utils.torch_utils import set_default_torch_dtype
     from vllm.model_executor.layers import rotary_embedding
     from .layerwise import retire_block
+    # bitsandbytes creates process-global CPU NF4/FP4 lookup tables on first import.
+    # Import the already fingerprinted dependency before MetaOnly so that the
+    # constructor guard continues to reject every real allocation it observes.
+    initialize_constructor_runtime(cfg)
     class MetaOnly(TorchDispatchMode):
         def __torch_dispatch__(self, func, types, args=(), kwargs=None):
             kwargs = kwargs or {}
