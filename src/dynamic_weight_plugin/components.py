@@ -263,11 +263,107 @@ def _populate_planning_view(model, view, paths):
     return probes
 
 
-def _plan_units(model, entries):
-    import torch
-    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+def _attach_trace_loaders(view, probes, trace):
     from vllm.model_executor.model_loader.reload.meta import CopyCounter
     from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+    for name, param in view.named_parameters():
+        path = name.rsplit('.', 1)[0]
+        native = getattr(param, 'weight_loader', default_weight_loader)
+        if path not in probes:
+            # Retained tensors are only mapped, never reloaded by ALTER.
+            def retained(param, data, *args, _name=name, **kwargs):
+                trace.destinations[trace.current_source].add(('retained', _name))
+
+            param.weight_loader = retained
+            continue
+
+        def recorded(
+            param,
+            data=None,
+            *args,
+            _name=name,
+            _path=path,
+            _native=native,
+            **kwargs,
+        ):
+            keyword_data = data is None and 'loaded_weight' in kwargs
+            if keyword_data:
+                data = kwargs['loaded_weight']
+            shard = getattr(data, 'shard_id', args[0] if args else None)
+            key = (_name, repr(shard), repr(kwargs))
+            if key in trace.events:
+                raise ValueError('Duplicate native destination shard: ' + _name)
+            trace.events.add(key)
+            with CopyCounter() as counter:
+                result = (
+                    _native(param, *args, **kwargs)
+                    if keyword_data
+                    else _native(param, data, *args, **kwargs)
+                )
+            if counter.copied_numel <= 0:
+                raise ValueError('Native component loader did not copy: ' + _name)
+            trace.loaded_elements[_name] += counter.copied_numel
+            trace.destinations[trace.current_source].add((_path, _name))
+            return result
+
+        param.weight_loader = recorded
+
+
+def _trace_checkpoint_entries(view, entries, trace):
+    import torch
+
+    ignored_suffixes = (
+        'rotary_emb.inv_freq',
+        'rotary_emb.cos_cached',
+        'rotary_emb.sin_cached',
+    )
+    for entry in entries:
+        trace.current_source = entry[1]
+        source = torch.empty(entry[3], dtype=torch.bfloat16, device='meta')
+        view.load_weights(iter([(entry[1], source)]))
+        if not trace.destinations[entry[1]] and not entry[1].endswith(
+            ignored_suffixes
+        ):
+            raise ValueError('Unaccounted canonical tensor: ' + entry[1])
+
+
+def _validate_traced_components(probes, trace):
+    for path, probe in probes.items():
+        for name, param in probe.named_parameters():
+            key = path + '.' + name
+            if trace.loaded_elements[key] != param.numel():
+                raise ValueError('Incomplete native component: ' + key)
+
+
+def _build_component_units(model, paths, entries, probes, trace):
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+    units = [
+        {
+            'path': path,
+            'entries': [],
+            'kind': 'experts' if type(probe) is RoutedExperts else 'linear',
+            'logical_bytes': sum(p.numel() * 2 for p in probe.parameters()),
+        }
+        for path, probe in probes.items()
+    ]
+    by_path = {unit['path']: unit for unit in units}
+    aliases = registered_aliases(model, paths)
+    for unit in units:
+        unit['aliases'] = [
+            alias for alias, path in aliases.items() if path == unit['path']
+        ]
+    for entry in entries:
+        owners = {path for path, _ in trace.destinations[entry[1]]}
+        if len(owners) > 1:
+            raise ValueError('Canonical tensor spans replacement owners: ' + entry[1])
+        if owners and next(iter(owners)) != 'retained':
+            by_path[next(iter(owners))]['entries'].append(entry)
+    return units
+
+
+def _plan_units(model, entries):
     from .layerwise import retire_block
 
     paths = _component_paths(model)
@@ -278,89 +374,10 @@ def _plan_units(model, entries):
     trace = _LoadTrace()
     try:
         probes = _populate_planning_view(model, view, paths)
-
-        for name, param in view.named_parameters():
-            path = name.rsplit('.', 1)[0]
-            native = getattr(param, 'weight_loader', default_weight_loader)
-            if path not in probes:
-                # Retained tensors are only mapped, never reloaded by ALTER.
-                def retained(param, data, *args, _name=name, **kwargs):
-                    trace.destinations[trace.current_source].add(('retained', _name))
-                param.weight_loader = retained
-                continue
-
-            def recorded(
-                param,
-                data=None,
-                *args,
-                _name=name,
-                _path=path,
-                _native=native,
-                **kwargs,
-            ):
-                keyword_data = data is None and 'loaded_weight' in kwargs
-                if keyword_data:
-                    data = kwargs['loaded_weight']
-                shard = getattr(data, 'shard_id', args[0] if args else None)
-                key = (_name, repr(shard), repr(kwargs))
-                if key in trace.events:
-                    raise ValueError('Duplicate native destination shard: ' + _name)
-                trace.events.add(key)
-                with CopyCounter() as counter:
-                    result = (
-                        _native(param, *args, **kwargs)
-                        if keyword_data
-                        else _native(param, data, *args, **kwargs)
-                    )
-                if counter.copied_numel <= 0:
-                    raise ValueError('Native component loader did not copy: ' + _name)
-                trace.loaded_elements[_name] += counter.copied_numel
-                trace.destinations[trace.current_source].add((_path, _name))
-                return result
-
-            param.weight_loader = recorded
-        for entry in entries:
-            trace.current_source = entry[1]
-            source = torch.empty(entry[3], dtype=torch.bfloat16, device='meta')
-            view.load_weights(iter([(entry[1], source)]))
-            if not trace.destinations[entry[1]]:
-                # Native loaders discard derived rotary tables; no other
-                # ignored checkpoint fields are accepted without review.
-                if not entry[1].endswith(
-                    (
-                        'rotary_emb.inv_freq',
-                        'rotary_emb.cos_cached',
-                        'rotary_emb.sin_cached',
-                    )
-                ):
-                    raise ValueError('Unaccounted canonical tensor: ' + entry[1])
-        for path, probe in probes.items():
-            for name, param in probe.named_parameters():
-                key = path + '.' + name
-                if trace.loaded_elements[key] != param.numel():
-                    raise ValueError('Incomplete native component: ' + key)
-        result = [
-            {
-                'path': path,
-                'entries': [],
-                'kind': 'experts' if type(probe) is RoutedExperts else 'linear',
-                'logical_bytes': sum(p.numel() * 2 for p in probe.parameters()),
-            }
-            for path, probe in probes.items()
-        ]
-        by_path = {unit['path']: unit for unit in result}
-        aliases = registered_aliases(model, paths)
-        for unit in result:
-            unit['aliases'] = [
-                alias for alias, path in aliases.items() if path == unit['path']
-            ]
-        for entry in entries:
-            owners = {path for path, _ in trace.destinations[entry[1]]}
-            if len(owners) > 1:
-                raise ValueError('Canonical tensor spans replacement owners: ' + entry[1])
-            if owners and next(iter(owners)) != 'retained':
-                by_path[next(iter(owners))]['entries'].append(entry)
-        return result
+        _attach_trace_loaders(view, probes, trace)
+        _trace_checkpoint_entries(view, entries, trace)
+        _validate_traced_components(probes, trace)
+        return _build_component_units(model, paths, entries, probes, trace)
     finally:
         # Remove native bound-loader cycles, including the recording closures.
         retire_block(view, set())

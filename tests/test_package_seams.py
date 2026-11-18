@@ -7,13 +7,14 @@ import tempfile
 import tomllib
 import unittest
 from unittest.mock import patch
+import weakref
 
 from fastapi import FastAPI
 import httpx
 
 import dynamic_weight_plugin
 from dynamic_weight_plugin import compat
-from dynamic_weight_plugin.adapter import EngineBackend
+from dynamic_weight_plugin.adapter import EngineBackend, ReplacementPreparation
 from dynamic_weight_plugin.compat import verify_runtime
 from dynamic_weight_plugin.endpoints import (
     DynamicWeightEndpoints,
@@ -65,6 +66,44 @@ class Client:
 
 
 class PackageSeamTests(unittest.TestCase):
+    def test_safe_recovery_drops_preparation_before_collection(self):
+        from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
+
+        class Iterator:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        iterator = Iterator()
+        backend = object.__new__(EngineBackend)
+        backend.destructive_started = False
+        backend.preparation = ReplacementPreparation(
+            config=object(),
+            metadata_before={id(layer) for layer in LAYERWISE_INFO},
+            mode="drain",
+            iterator=iterator,
+        )
+        preparation_ref = weakref.ref(backend.preparation)
+        backend.runner = SimpleNamespace(
+            model=SimpleNamespace(modules=lambda: iter(()))
+        )
+        observed = []
+
+        def collect():
+            observed.append(
+                (backend.preparation, preparation_ref())
+            )
+
+        with (
+            patch("torch.cuda.synchronize"),
+            patch("dynamic_weight_plugin.adapter.collect_retired", side_effect=collect),
+        ):
+            backend.recover_preparation()
+        self.assertTrue(iterator.closed)
+        self.assertIsNone(backend.preparation)
+        self.assertEqual(observed, [(None, None)])
+
     def test_successful_bitsandbytes_identity_is_cached_after_import(self):
         profile = {
             "bitsandbytes": {"version": "0.50.2", "files": {}},
@@ -175,9 +214,31 @@ class PackageSeamTests(unittest.TestCase):
             "vllm/v1/engine/core_client.py",
         }
         for version in ("0.32.0", "0.33.0"):
-            files = compat.runtime_profile(version)["files"]
+            profile = compat.runtime_profile(version)
+            files = profile["files"]
             self.assertTrue(required <= files.keys())
             self.assertTrue(removed.isdisjoint(files))
+            extra = "runtime" + version.replace(".", "")[:3]
+            pinned = dict(
+                requirement.split("==", 1)
+                for requirement in data["project"]["optional-dependencies"][extra]
+                if "==" in requirement
+            )
+            bitsandbytes = profile.get("bitsandbytes")
+            expected_dependencies = {
+                "vllm": version,
+                **profile["dependencies"],
+                "bitsandbytes": (
+                    bitsandbytes["version"]
+                    if bitsandbytes is not None
+                    else profile["bitsandbytes_version"]
+                ),
+                "vllm-bnb-plugin": profile["bitsandbytes_plugin"]["version"],
+            }
+            self.assertLessEqual(
+                expected_dependencies.items(),
+                pinned.items(),
+            )
         verify_runtime()
 
     def test_backend_fence_trips_plugin_guard(self):

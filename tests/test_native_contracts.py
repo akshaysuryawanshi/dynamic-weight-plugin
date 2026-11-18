@@ -14,7 +14,9 @@ from dynamic_weight_plugin.component_policy import (
     inspect_policy,
     native_policy,
 )
+from dynamic_weight_plugin.adapter import configuration_issues, validate_config
 from dynamic_weight_plugin.compat import runtime_profile
+from dynamic_weight_plugin.config_issues import ConfigIssueCode
 from dynamic_weight_plugin.control import ControlError
 from dynamic_weight_plugin.models import _verify_selected_class_source
 from dynamic_weight_plugin.policy import loading_plan
@@ -43,6 +45,128 @@ class Model:
 
 
 class NativeContractTests(unittest.TestCase):
+    def test_configuration_findings_keep_identity_order_and_messages(self):
+        parallel = SimpleNamespace(
+            distributed_executor_backend="ray",
+            tensor_parallel_size=2,
+            pipeline_parallel_size=3,
+            data_parallel_size=4,
+            decode_context_parallel_size=5,
+            prefill_context_parallel_size=6,
+            enable_fault_tolerance=True,
+            use_ubatching=False,
+            worker_extension_cls="custom.Worker",
+        )
+        model = SimpleNamespace(
+            trust_remote_code=True,
+            enable_prompt_embeds=True,
+            is_multimodal_model=True,
+            enforce_eager=False,
+            dtype="torch.float16",
+            hf_config=SimpleNamespace(quantization_config={"quant_method": "old"}),
+            model="/path/that/does/not/exist",
+            enable_sleep_mode=True,
+            enable_cumem_allocator=True,
+        )
+        config = SimpleNamespace(
+            parallel_config=parallel,
+            model_config=model,
+            scheduler_config=SimpleNamespace(
+                async_scheduling=True, scheduler_cls="custom.Scheduler"
+            ),
+            cache_config=SimpleNamespace(cache_dtype="fp8"),
+            compilation_config=SimpleNamespace(
+                cudagraph_mode=SimpleNamespace(name="FULL"),
+                mode=SimpleNamespace(value=1),
+            ),
+            observability_config=SimpleNamespace(
+                otlp_traces_endpoint="http://traces"
+            ),
+            load_config=SimpleNamespace(load_format="auto"),
+            device_config=SimpleNamespace(device_type="cpu"),
+            use_v2_model_runner=True,
+            speculative_config=object(),
+            lora_config=object(),
+            kv_transfer_config=object(),
+            ec_transfer_config=object(),
+            weight_transfer_config=object(),
+            aux_output_config=SimpleNamespace(enabled=True),
+            offload_config=SimpleNamespace(
+                uva=SimpleNamespace(cpu_offload_gb=1),
+                prefetch=SimpleNamespace(offload_group_size=0),
+            ),
+        )
+        expected_messages = [
+            "development RPC routes must be disabled",
+            "--distributed-executor-backend uni required",
+            "tensor_parallel_size must equal 1",
+            "pipeline_parallel_size must equal 1",
+            "data_parallel_size must equal 1",
+            "decode_context_parallel_size must equal 1",
+            "prefill_context_parallel_size must equal 1",
+            "fault tolerance and ubatching unsupported",
+            "V1 runner with --no-async-scheduling required",
+            "remote model/tokenizer code must be disabled",
+            "prompt embeddings must be disabled on the reviewed runtime",
+            "multimodal serving is outside the reviewed safety contract",
+            "OTLP tracing is outside the reviewed safety contract",
+            "--enforce-eager required",
+            "compilation must be disabled",
+            "BF16 model configuration required",
+            "representation rejected",
+            "canonical checkpoint must be unquantized",
+            "an immutable local checkpoint directory is required",
+            "sleep/CuMem allocator unsupported",
+            "BF16 KV required",
+            "custom schedulers/worker extensions unsupported",
+            "speculative_config unsupported",
+            "lora_config unsupported",
+            "kv_transfer_config unsupported",
+            "ec_transfer_config unsupported",
+            "weight_transfer_config unsupported",
+            "auxiliary output connectors unsupported",
+            "weight offload unsupported",
+            "CUDA required",
+        ]
+        with (
+            patch.dict("os.environ", {"VLLM_SERVER_DEV_MODE": "1"}),
+            patch(
+                "dynamic_weight_plugin.adapter.model_adapter",
+                side_effect=ValueError("representation rejected"),
+            ),
+        ):
+            issues = configuration_issues(config)
+            self.assertEqual([issue.message for issue in issues], expected_messages)
+            with self.assertRaisesRegex(
+                ValueError,
+                "^Unsupported dynamic quantization configuration: "
+                + "; ".join(expected_messages)
+                + "$",
+            ):
+                validate_config(config)
+
+        self.assertEqual(issues[1].code, ConfigIssueCode.EXECUTOR)
+        self.assertEqual((issues[1].actual, issues[1].expected), ("ray", "uni"))
+        parallel_issue = issues[2]
+        self.assertEqual(parallel_issue.code, ConfigIssueCode.PARALLEL_SIZE)
+        self.assertEqual(
+            (parallel_issue.field, parallel_issue.actual, parallel_issue.expected),
+            ("tensor_parallel_size", 2, 1),
+        )
+        self.assertEqual(issues[15].code, ConfigIssueCode.MODEL_DTYPE)
+        self.assertEqual(issues[20].code, ConfigIssueCode.KV_DTYPE)
+        self.assertEqual(issues[-1].code, ConfigIssueCode.DEVICE)
+
+        with (
+            patch.dict("os.environ", {"VLLM_SERVER_DEV_MODE": "0"}),
+            patch(
+                "dynamic_weight_plugin.adapter.model_adapter",
+                side_effect=OSError("native import failed"),
+            ),
+        ):
+            with self.assertRaisesRegex(OSError, "native import failed"):
+                configuration_issues(config)
+
     def test_profiles_admit_the_same_seven_component_formats(self):
         expected = {
             "bf16",

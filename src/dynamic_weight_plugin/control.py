@@ -1,6 +1,8 @@
 """Engine-thread-owned weight transition state, independent of torch and HTTP."""
 
 from copy import deepcopy
+from dataclasses import dataclass
+from enum import Enum
 from time import monotonic_ns
 from uuid import uuid4
 
@@ -9,6 +11,13 @@ MAX_PREPARATION_SLICES = 1024
 DEFAULT_DRAIN_TIMEOUT_MS = 30_000
 DEFAULT_PREPARATION_TIMEOUT_MS = 120_000
 MAX_TIMEOUT_MS = 3_600_000
+
+
+class _Absent(Enum):
+    VALUE = "absent"
+
+
+_OMITTED = _Absent.VALUE
 
 
 class ControlError(ValueError):
@@ -41,17 +50,89 @@ def release_exception_frames(error):
         current.__cause__ = current.__context__ = None
 
 
+@dataclass
+class Operation:
+    operation_id: str
+    target: str
+    mode: str
+    state: str
+    drain_timeout_ms: int
+    preparation_timeout_ms: int
+    started_ns: int
+    strategy: str | _Absent = _OMITTED
+    scheduling: str | _Absent = _OMITTED
+    consistency: str | _Absent = _OMITTED
+    rollback_available: bool | _Absent = _OMITTED
+    finished_ns: int | _Absent = _OMITTED
+    generation: int | _Absent = _OMITTED
+    error: str | _Absent = _OMITTED
+    error_code: str | _Absent = _OMITTED
+    deadline_stage: str | _Absent = _OMITTED
+    deadline_ns: int | _Absent = _OMITTED
+    preparing_inference_steps: int | _Absent = _OMITTED
+    drained_ns: int | _Absent = _OMITTED
+    slice_count: int = 0
+    phase_count: int = 0
+
+    @classmethod
+    def start(
+        cls,
+        target,
+        mode,
+        drain_timeout_ms,
+        preparation_timeout_ms,
+        plan,
+    ):
+        planned = {
+            name: plan[name]
+            for name in ("strategy", "scheduling", "consistency", "rollback_available")
+            if name in plan
+        }
+        return cls(
+            operation_id=str(uuid4()),
+            target=target,
+            mode=mode,
+            state="draining",
+            drain_timeout_ms=drain_timeout_ms,
+            preparation_timeout_ms=preparation_timeout_ms,
+            started_ns=monotonic_ns(),
+            **planned,
+        )
+
+
+_SUMMARY_FIELDS = (
+    "operation_id",
+    "target",
+    "mode",
+    "state",
+    "started_ns",
+    "finished_ns",
+    "generation",
+    "strategy",
+    "scheduling",
+    "consistency",
+    "error",
+    "error_code",
+    "deadline_stage",
+    "deadline_ns",
+    "drain_timeout_ms",
+    "preparation_timeout_ms",
+    "preparing_inference_steps",
+    "slice_count",
+    "phase_count",
+)
+
+
 def operation_summary(operation):
     if operation is None:
         return None
-    scalar = (
-        "operation_id", "target", "mode", "state", "started_ns", "finished_ns",
-        "generation", "strategy", "scheduling", "consistency", "error",
-        "error_code", "deadline_stage", "deadline_ns", "drain_timeout_ms",
-        "preparation_timeout_ms", "preparing_inference_steps",
-        "slice_count", "phase_count",
+    return deepcopy(
+        {
+            name: value
+            for name in _SUMMARY_FIELDS
+            if (value := getattr(operation, name)) is not _OMITTED
+        }
     )
-    return deepcopy({key: operation[key] for key in scalar if key in operation})
 
 
 class Controller:
@@ -99,26 +180,25 @@ class Controller:
                     "invalid_request", f"timeouts must be integers in 1..{MAX_TIMEOUT_MS} ms"
                 )
         plan = self.backend.validate(target, mode)
-        operation = {
-            "operation_id": str(uuid4()), "target": target, "mode": mode,
-            "state": "draining", "drain_timeout_ms": drain_timeout_ms,
-            "preparation_timeout_ms": preparation_timeout_ms,
-            "started_ns": monotonic_ns(), "slice_count": 0, "phase_count": 0,
-            **plan,
-        }
+        operation = Operation.start(
+            target,
+            mode,
+            drain_timeout_ms,
+            preparation_timeout_ms,
+            plan,
+        )
         self.latest = operation
         if target == self.current_format:
-            operation.update(state="unchanged", generation=self.generation,
-                             finished_ns=monotonic_ns())
+            operation.state = "unchanged"
+            operation.generation = self.generation
+            operation.finished_ns = monotonic_ns()
             return operation_summary(operation)
         self.active = operation
         try:
             if mode == "dirty":
-                operation.update(
-                    state="preparing",
-                    preparing_inference_steps=0,
-                    consistency="mixed_weight_generations_with_existing_kv",
-                )
+                operation.state = "preparing"
+                operation.preparing_inference_steps = 0
+                operation.consistency = "mixed_weight_generations_with_existing_kv"
                 self._arm_deadline(operation, "preparation", preparation_timeout_ms)
                 self.backend.begin_replacement(target, dirty=True)
                 self._check_deadline(operation)
@@ -131,17 +211,18 @@ class Controller:
 
     def _arm_deadline(self, operation, stage, timeout_ms):
         deadline = monotonic_ns() + timeout_ms * 1_000_000
-        operation.update(deadline_stage=stage, deadline_ns=deadline)
+        operation.deadline_stage = stage
+        operation.deadline_ns = deadline
         self.backend.arm_deadline(deadline)
 
     @staticmethod
     def _check_deadline(operation):
-        if monotonic_ns() >= operation["deadline_ns"]:
-            raise OperationDeadline(operation["deadline_stage"])
+        if monotonic_ns() >= operation.deadline_ns:
+            raise OperationDeadline(operation.deadline_stage)
 
     def poll_deadline(self):
         operation = self.active
-        if operation is not None and operation["state"] in {"draining", "preparing"}:
+        if operation is not None and operation.state in {"draining", "preparing"}:
             try:
                 self._check_deadline(operation)
             except OperationDeadline as error:
@@ -150,17 +231,17 @@ class Controller:
     def advance(self, model_executed=False):
         self.poll_deadline()
         operation = self.active
-        if not operation or operation["mode"] != "dirty" or operation["state"] != "preparing":
+        if not operation or operation.mode != "dirty" or operation.state != "preparing":
             return
         try:
-            operation["preparing_inference_steps"] += bool(model_executed)
+            operation.preparing_inference_steps += bool(model_executed)
             result = self.backend.advance_replacement()
-            operation["slice_count"] += 1
+            operation.slice_count += 1
             self._check_deadline(operation)
-            if operation["slice_count"] > MAX_PREPARATION_SLICES:
+            if operation.slice_count > MAX_PREPARATION_SLICES:
                 raise RuntimeError("Preparation exceeded the bounded slice count")
             if result.get("ready"):
-                operation["phase_count"] += 1
+                operation.phase_count += 1
                 self._drained(operation)
         except Exception as error:
             self._fail(operation, error)
@@ -174,19 +255,19 @@ class Controller:
         candidate = None
         try:
             self._check_deadline(operation)
-            if operation["mode"] == "dirty":
+            if operation.mode == "dirty":
                 candidate = self.backend.take_candidate()
             else:
                 self.backend.assert_drained()
-                operation["drained_ns"] = monotonic_ns()
-                operation["state"] = "preparing"
+                operation.drained_ns = monotonic_ns()
+                operation.state = "preparing"
                 self._arm_deadline(
-                    operation, "preparation", operation["preparation_timeout_ms"]
+                    operation, "preparation", operation.preparation_timeout_ms
                 )
                 candidate = self.backend.prepare_components(
-                    operation["target"], lambda: self._check_deadline(operation)
+                    operation.target, lambda: self._check_deadline(operation)
                 )
-                operation["phase_count"] += 1
+                operation.phase_count += 1
             self._check_deadline(operation)
             self.backend.precommit(candidate)
             self._check_deadline(operation)
@@ -196,15 +277,15 @@ class Controller:
             self._fail(operation, failure)
             return
         try:
-            operation["state"] = "committing"
+            operation.state = "committing"
             self.backend.commit(candidate)
-            operation["phase_count"] += 1
-            self.current_format = operation["target"]
+            operation.phase_count += 1
+            self.current_format = operation.target
             self.generation += 1
             self.backend.resume()
-            operation.update(
-                state="completed", generation=self.generation, finished_ns=monotonic_ns()
-            )
+            operation.state = "completed"
+            operation.generation = self.generation
+            operation.finished_ns = monotonic_ns()
             self.active = None
         except Exception as failure:
             self._fence(operation, failure)
@@ -215,7 +296,8 @@ class Controller:
         message = str(error)[:2048]
         timed_out = isinstance(error, OperationDeadline)
         if timed_out:
-            operation.update(error_code="deadline_exceeded", deadline_stage=error.stage)
+            operation.error_code = "deadline_exceeded"
+            operation.deadline_stage = error.stage
         release_exception_frames(error)
         try:
             self.backend.recover_preparation()
@@ -223,14 +305,15 @@ class Controller:
         except Exception as recovery:
             self._fence(operation, RuntimeError(f"{message}; recovery: {recovery}"))
             return
-        operation.update(
-            state="timed_out" if timed_out else "rolled_back",
-            error=message, finished_ns=monotonic_ns(),
-        )
+        operation.state = "timed_out" if timed_out else "rolled_back"
+        operation.error = message
+        operation.finished_ns = monotonic_ns()
         self.active = None
 
     def _fence(self, operation, error):
         self.fatal = str(error)[:2048]
-        operation.update(state="failed_unsafe", error=self.fatal, finished_ns=monotonic_ns())
+        operation.state = "failed_unsafe"
+        operation.error = self.fatal
+        operation.finished_ns = monotonic_ns()
         self.active = None
         self.backend.fence(self.fatal)

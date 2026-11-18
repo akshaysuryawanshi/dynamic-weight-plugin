@@ -90,17 +90,21 @@ KV remain BF16; activation arithmetic follows the native recipe.
 Startup verifies the exact dependency versions and native interface
 fingerprints in the selected profile and rejects differing builds.
 
-The current source passes 27 focused CPU tests on both exact runtime profiles.
-The November 17 cleanup candidate was also checked on both exact releases with
-eager, batch-invariant Qwen3-0.6B on one Ada SM89 GPU and the trusted-local
+The current source passes 30 focused CPU tests on both exact runtime profiles.
+Fresh Python 3.11 installations of both complete runtime extras passed dependency
+and native fingerprint checks. This structural revision names component-planning
+and canary resource phases and uses typed internal records for operations and
+replacement preparation; dictionaries remain at the API boundary. The final
+November 17 build was also checked on both exact releases with eager,
+batch-invariant Qwen3-0.6B on one Ada SM89 GPU and the trusted-local
 writable-source setting. Unauthenticated routes worked; invalid-schema and MXFP4
 dirty requests returned 422 without changing state; a BF16-to-FP8 drain preserved
 an active 384-token response; BF16 dirty restoration interleaved 116 inference
 steps; and a restored 32-token output matched the BF16 baseline prefix. Native
-checks that predate this cleanup ran on November 16 with the same model and GPU.
+checks that predate this structural revision ran on November 16 with the same model and GPU.
 Per-tensor FP8 was exercised on both vLLM releases. On 0.33, block FP8 and MXFP8
-matched three fresh-native 32-token settled outputs after
-drain and dirty switches; MXFP4 Marlin W4A16 matched in drain mode; and
+matched three fresh-native 32-token settled outputs after drain and dirty
+switches; MXFP4 Marlin W4A16 matched in drain mode; and
 bitsandbytes NF4 matched a fresh native NF4 target. BF16 restorations matched the
 BF16 baseline. These checks do not establish throughput, broad model or hardware
 coverage, MoE qualification, or equivalence for mixed-generation dirty requests.

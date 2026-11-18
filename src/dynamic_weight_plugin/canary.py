@@ -5,7 +5,7 @@ All global contexts close before yielding back to the engine thread.
 """
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import monotonic
 
 PREFILL_TOKENS = 4
@@ -20,6 +20,18 @@ class CanaryPlan:
     spec: object
     group: object
     scratch_bytes: int
+
+
+@dataclass
+class CanaryResources:
+    """Private KV owners retained across cooperative canary slices."""
+
+    device: object
+    context: dict
+    saved_bindings: dict = field(default_factory=dict)
+    caches: dict = field(default_factory=dict)
+    metadata_groups: list = field(default_factory=list)
+    scratch_bytes: int = 0
 
 
 def require_finite(tensor, stage):
@@ -70,75 +82,170 @@ def plan_canary(config, allow_bound=False):
     return plans
 
 
-def canary_slices(config, model, allow_bound=False):
+@contextmanager
+def _canary_scope(config, device):
     import torch
     from vllm.config import set_current_vllm_config
-    from vllm.forward_context import set_forward_context
     from vllm.utils.torch_utils import set_default_torch_dtype
-    from vllm.v1.attention.backend import CommonAttentionMetadata
+
+    with (
+        torch.inference_mode(),
+        set_current_vllm_config(config),
+        set_default_torch_dtype(config.model_config.dtype),
+        device,
+    ):
+        yield
+
+
+def _restore_bindings(resources):
+    for name, original in resources.saved_bindings.items():
+        resources.context[name].bind_kv_cache(original)
+
+
+@contextmanager
+def _forward_scope(config, resources, allow_bound):
+    with _canary_scope(config, resources.device):
+        try:
+            if allow_bound:
+                for name, cache in resources.caches.items():
+                    resources.context[name].bind_kv_cache(cache)
+            yield
+        finally:
+            if allow_bound:
+                _restore_bindings(resources)
+
+
+def _allocate_canary_resources(config, resources, allow_bound):
+    import torch
     from vllm.v1.kv_cache_interface import (
         KVCacheConfig, KVCacheGroupSpec, KVCacheTensor,
     )
     from vllm.v1.worker.utils import allocate_kv_cache
 
-    started = monotonic()
-    device = torch.device(config.device_config.device)
-    context = config.compilation_config.static_forward_context
-    saved, caches, groups = {}, {}, []
-    scratch_bytes = 0
+    with _canary_scope(config, resources.device):
+        plans = plan_canary(config, allow_bound)
+        resources.scratch_bytes = sum(plan.scratch_bytes for plan in plans)
+        for plan in plans:
+            private = KVCacheConfig(
+                2,
+                [
+                    KVCacheTensor(
+                        plan.scratch_bytes,
+                        [plan.name],
+                        plan.scratch_bytes,
+                        plan.spec.page_size_bytes,
+                    )
+                ],
+                [KVCacheGroupSpec([plan.name], plan.spec)],
+            )
+            cache = allocate_kv_cache(
+                private,
+                resources.device,
+                config.cache_config.get_resolved_kv_cache_layout(),
+                [plan.spec.block_size],
+            )[plan.name]
+            resources.saved_bindings[plan.name] = plan.layer.kv_cache
+            resources.caches[plan.name] = cache
+            plan.layer.bind_kv_cache(cache)
+            plan.group.create_metadata_builders(
+                config, resources.device, plan.spec.block_size
+            )
+            resources.metadata_groups.append(
+                (
+                    plan.name,
+                    plan.spec.block_size,
+                    plan.group.get_metadata_builder(),
+                )
+            )
+        torch.cuda.synchronize()
+        if allow_bound:
+            _restore_bindings(resources)
 
-    @contextmanager
-    def scope():
-        with (torch.inference_mode(), set_current_vllm_config(config),
-              set_default_torch_dtype(config.model_config.dtype), device):
-            yield
+
+def _run_canary_stage(
+    config,
+    model,
+    resources,
+    allow_bound,
+    stage,
+    count,
+    offset,
+    next_token,
+    vocab_size,
+):
+    import torch
+    from vllm.forward_context import set_forward_context
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+
+    with _forward_scope(config, resources, allow_bound):
+        positions = torch.arange(offset, offset + count, device=resources.device)
+        ids = (
+            torch.arange(count, device=resources.device) % vocab_size
+            if stage == "prefill"
+            else torch.tensor([next_token], dtype=torch.long, device=resources.device)
+        )
+        starts_cpu = torch.tensor([0, count], dtype=torch.int32, device="cpu")
+        lengths_cpu = torch.tensor([offset + count], dtype=torch.int32, device="cpu")
+        metadata, slots = {}, {}
+        for name, block_size, builder in resources.metadata_groups:
+            slot = positions + block_size
+            common = CommonAttentionMetadata(
+                query_start_loc=starts_cpu.to(resources.device),
+                query_start_loc_cpu=starts_cpu,
+                seq_lens=lengths_cpu.to(resources.device),
+                seq_lens_cpu_upper_bound=lengths_cpu,
+                num_reqs=1,
+                num_actual_tokens=count,
+                max_query_len=count,
+                max_seq_len=offset + count,
+                block_table_tensor=torch.tensor(
+                    [[1]], dtype=torch.int32, device=resources.device
+                ),
+                slot_mapping=slot,
+                positions=positions,
+                is_prefilling=torch.tensor(
+                    [stage == "prefill"], device=resources.device
+                ),
+            )
+            metadata[name] = builder.build(0, common)
+            slots[name] = slot
+        with set_forward_context(
+            metadata, config, num_tokens=count, slot_mapping=slots
+        ):
+            hidden = model(input_ids=ids, positions=positions)
+            require_finite(hidden, stage + " hidden states")
+            logits = model.compute_logits(hidden[-1:])
+            require_finite(logits, stage + " logits")
+            selected_token = int(logits.argmax(dim=-1).item())
+            if not 0 <= selected_token < vocab_size:
+                raise ValueError(
+                    "Candidate canary selected a token outside the vocabulary"
+                )
+        torch.cuda.synchronize()
+        del hidden, logits, metadata, slots, common, slot, ids, positions
+    return selected_token
+
+
+def canary_slices(config, model, allow_bound=False):
+    import torch
+
+    started = monotonic()
+    resources = CanaryResources(
+        device=torch.device(config.device_config.device),
+        context=config.compilation_config.static_forward_context,
+    )
 
     def check_deadline():
         if monotonic() - started > DEADLINE_SECONDS:
             raise TimeoutError("Candidate canary cooperative deadline exceeded")
 
-    def restore_bindings():
-        for name, original in saved.items():
-            context[name].bind_kv_cache(original)
-
-    @contextmanager
-    def forward_scope():
-        with scope():
-            try:
-                if allow_bound:
-                    for name, cache in caches.items():
-                        context[name].bind_kv_cache(cache)
-                yield
-            finally:
-                if allow_bound:
-                    restore_bindings()
-
     try:
-        with scope():
-            plans = plan_canary(config, allow_bound)
-            scratch_bytes = sum(plan.scratch_bytes for plan in plans)
-            for plan in plans:
-                name = plan.name
-                layer = plan.layer
-                spec = plan.spec
-                group = plan.group
-                size = plan.scratch_bytes
-                private = KVCacheConfig(2, [KVCacheTensor(
-                    size, [name], size, spec.page_size_bytes,
-                )], [KVCacheGroupSpec([name], spec)])
-                cache = allocate_kv_cache(private, device,
-                                         config.cache_config.get_resolved_kv_cache_layout(),
-                                         [spec.block_size])[name]
-                saved[name] = layer.kv_cache
-                caches[name] = cache
-                layer.bind_kv_cache(cache)
-                group.create_metadata_builders(config, device, spec.block_size)
-                groups.append((name, spec.block_size, group.get_metadata_builder()))
-            torch.cuda.synchronize()
-            if allow_bound:
-                restore_bindings()
+        _allocate_canary_resources(config, resources, allow_bound)
         check_deadline()
-        yield {"kind": "canary_allocate", "scratch_kv_bytes": scratch_bytes}
+        yield {
+            "kind": "canary_allocate",
+            "scratch_kv_bytes": resources.scratch_bytes,
+        }
 
         vocab_size = config.model_config.get_vocab_size()
         if vocab_size < 1 or config.model_config.max_model_len < PREFILL_TOKENS + 1:
@@ -147,46 +254,26 @@ def canary_slices(config, model, allow_bound=False):
         for stage, count, offset in (("prefill", PREFILL_TOKENS, 0),
                                      ("decode", 1, PREFILL_TOKENS)):
             check_deadline()
-            with forward_scope():
-                positions = torch.arange(offset, offset + count, device=device)
-                ids = (torch.arange(count, device=device) % vocab_size if stage == "prefill"
-                       else torch.tensor([next_token], dtype=torch.long, device=device))
-                starts_cpu = torch.tensor([0, count], dtype=torch.int32, device="cpu")
-                lengths_cpu = torch.tensor([offset + count], dtype=torch.int32, device="cpu")
-                metadata, slots = {}, {}
-                for name, block_size, builder in groups:
-                    slot = positions + block_size
-                    common = CommonAttentionMetadata(
-                        query_start_loc=starts_cpu.to(device), query_start_loc_cpu=starts_cpu,
-                        seq_lens=lengths_cpu.to(device), seq_lens_cpu_upper_bound=lengths_cpu,
-                        num_reqs=1, num_actual_tokens=count, max_query_len=count,
-                        max_seq_len=offset + count,
-                        block_table_tensor=torch.tensor([[1]], dtype=torch.int32, device=device),
-                        slot_mapping=slot, positions=positions,
-                        is_prefilling=torch.tensor([stage == "prefill"], device=device),
-                    )
-                    metadata[name] = builder.build(0, common)
-                    slots[name] = slot
-                with set_forward_context(metadata, config, num_tokens=count,
-                                         slot_mapping=slots):
-                    hidden = model(input_ids=ids, positions=positions)
-                    require_finite(hidden, stage + " hidden states")
-                    logits = model.compute_logits(hidden[-1:])
-                    require_finite(logits, stage + " logits")
-                    next_token = int(logits.argmax(dim=-1).item())
-                    if not 0 <= next_token < vocab_size:
-                        raise ValueError("Candidate canary selected a token outside the vocabulary")
-                torch.cuda.synchronize()
-                del hidden, logits, metadata, slots, common, slot, ids, positions
+            next_token = _run_canary_stage(
+                config,
+                model,
+                resources,
+                allow_bound,
+                stage,
+                count,
+                offset,
+                next_token,
+                vocab_size,
+            )
             check_deadline()
             yield {"kind": "canary_" + stage, "tokens": count}
     finally:
         # Unbind only candidate-owned caches, including partial allocation failure.
         # Device-health synchronization belongs to the caller's recovery path.
-        restore_bindings()
-        caches.clear()
-        groups.clear()
+        _restore_bindings(resources)
+        resources.caches.clear()
+        resources.metadata_groups.clear()
     yield {"kind": "canary_complete", "ready": True,
            "validation": {"prefill_tokens": PREFILL_TOKENS, "decode_tokens": 1,
-                          "scratch_kv_bytes": scratch_bytes,
+                          "scratch_kv_bytes": resources.scratch_bytes,
                           "elapsed_seconds": monotonic() - started}}

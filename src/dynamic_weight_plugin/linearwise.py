@@ -87,7 +87,7 @@ def prepare_linear(backend, cfg, unit):
     # before loading/quantization. Compiled quantizers must see the same scopes.
     with torch.device(cfg.device_config.device):
         new = type(old)(**args)
-    backend.holder["unit"] = new
+    backend.preparation.unit = new
     view = unit_view(backend.runner.model, unit["path"], new)
     bind_policy(view, cfg.quant_config, backend.native_quantization_policy)
     with native_workspace_budget(cfg):
@@ -138,7 +138,7 @@ def replace_slices(backend, cfg, components, dirty=False):
             del old
             if any(item() is not None for item in retired):
                 raise RuntimeError("Retired projection still has module owners")
-            backend.holder.pop("unit")
+            backend.preparation.unit = None
             torch.cuda.synchronize()
         yield {
             "kind": (
@@ -157,11 +157,11 @@ def replace_slices(backend, cfg, components, dirty=False):
     bind_policy(model, cfg.quant_config, backend.native_quantization_policy)
     for attention in live.values():
         attention.quant_config = cfg.quant_config
-    backend.holder["model"] = model
+    backend.preparation.model = model
     backend.validate_candidate(cfg, model)
     for result in canary_slices(cfg, model, allow_bound=True):
         if result.get("ready"):
-            backend.holder["validation"] = result["validation"]
+            backend.preparation.validation = result["validation"]
         # The canary restores serving bindings and closes global scopes before
         # every yield, retaining only its private scratch KV between stages.
         yield result

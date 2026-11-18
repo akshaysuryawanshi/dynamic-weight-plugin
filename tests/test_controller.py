@@ -17,8 +17,12 @@ class Backend:
         self.recover_count = 0
         self.fenced = None
         self.destructive_started = False
+        self.publication_count = 0
         self.fail_precommit = False
         self.fail_commit = False
+        self.fail_after_publication = False
+        self.timeout_after_publication = False
+        self.controller = None
         self.slices = []
 
     def validate(self, target, mode):
@@ -43,13 +47,26 @@ class Backend:
         return None
 
     def prepare_components(self, target, check):
+        if self.fail_after_publication or self.timeout_after_publication:
+            self._publish_first_component()
+            check()
         return target
 
     def begin_replacement(self, target, dirty=False):
         self.slices = [{"ready": True}]
 
     def advance_replacement(self):
+        if self.fail_after_publication or self.timeout_after_publication:
+            self._publish_first_component()
+            return {"ready": False}
         return self.slices.pop(0)
+
+    def _publish_first_component(self):
+        self.publication_count += 1
+        self.destructive_started = True
+        if self.fail_after_publication:
+            raise RuntimeError("failure after first component publication")
+        self.controller.active.deadline_ns = 0
 
     def take_candidate(self):
         return "fp8"
@@ -80,6 +97,11 @@ class ControllerTests(unittest.TestCase):
         controller = Controller(backend)
         first = controller.alter("fp8")
         self.assertEqual(first["state"], "draining")
+        self.assertIs(controller.active, controller.latest)
+        self.assertNotIn("finished_ns", first)
+        self.assertNotIn("error", first)
+        first["state"] = "detached"
+        self.assertEqual(controller.status()["active"]["state"], "draining")
         with self.assertRaisesRegex(ControlError, "Another alteration"):
             controller.alter("bf16")
         backend.callback()
@@ -109,7 +131,7 @@ class ControllerTests(unittest.TestCase):
         backend = Backend()
         controller = Controller(backend)
         controller.alter("fp8")
-        controller.active["deadline_ns"] = 0
+        controller.active.deadline_ns = 0
         controller.poll_deadline()
         self.assertEqual(controller.status()["operation"]["state"], "timed_out")
         self.assertEqual(backend.recover_count, 1)
@@ -135,6 +157,39 @@ class ControllerTests(unittest.TestCase):
         )
         self.assertTrue(controller.status()["restart_required"])
         self.assertIn("post-publication", backend.fenced)
+
+    def test_error_or_timeout_after_publication_always_fences(self):
+        for mode in ("drain", "dirty"):
+            for failure in ("error", "timeout"):
+                with self.subTest(mode=mode, failure=failure):
+                    backend = Backend()
+                    controller = Controller(backend)
+                    backend.controller = controller
+                    if failure == "error":
+                        backend.fail_after_publication = True
+                    else:
+                        backend.timeout_after_publication = True
+
+                    controller.alter("fp8", mode=mode)
+                    if mode == "drain":
+                        backend.callback()
+                    else:
+                        controller.advance(model_executed=True)
+
+                    status = controller.status()
+                    self.assertEqual(
+                        status["operation"]["state"], "failed_unsafe"
+                    )
+                    self.assertTrue(status["restart_required"])
+                    self.assertIsNone(status["active"])
+                    self.assertIsNotNone(backend.fenced)
+                    self.assertEqual(backend.publication_count, 1)
+                    self.assertEqual(backend.recover_count, 0)
+                    self.assertEqual(backend.resume_count, 0)
+                    with self.assertRaisesRegex(
+                        ControlError, "Engine requires restart"
+                    ):
+                        controller.alter("bf16")
 
 
 class NativeLifecycleTests(unittest.TestCase):

@@ -1,10 +1,12 @@
 """Private, version-pinned single-GPU adapter. Calls run on the engine thread."""
 
 from copy import copy, deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 import os
 
 from .control import ControlError
+from .config_issues import ConfigIssue, ConfigIssueCode as IssueCode
 from .capabilities import (
     representation_decision,
     require_representation,
@@ -27,17 +29,21 @@ def collect_retired():
         gc.freeze()
 
 
-def validate_config(config):
+def _execution_issues(config):
     parallel = config.parallel_config
-    model = config.model_config
     scheduler = config.scheduler_config
-    cache = config.cache_config
-    reasons = []
+    issues = []
 
     if os.environ.get("VLLM_SERVER_DEV_MODE", "0") != "0":
-        reasons.append("development RPC routes must be disabled")
+        issues.append(ConfigIssue(IssueCode.DEVELOPMENT_ROUTES))
     if parallel.distributed_executor_backend != "uni":
-        reasons.append("--distributed-executor-backend uni required")
+        issues.append(
+            ConfigIssue(
+                IssueCode.EXECUTOR,
+                actual=parallel.distributed_executor_backend,
+                expected="uni",
+            )
+        )
     for name in (
         "tensor_parallel_size",
         "pipeline_parallel_size",
@@ -45,32 +51,59 @@ def validate_config(config):
         "decode_context_parallel_size",
         "prefill_context_parallel_size",
     ):
-        if getattr(parallel, name, 1) != 1:
-            reasons.append(name + " must equal 1")
+        size = getattr(parallel, name, 1)
+        if size != 1:
+            issues.append(
+                ConfigIssue(
+                    IssueCode.PARALLEL_SIZE,
+                    field=name,
+                    actual=size,
+                    expected=1,
+                )
+            )
     if getattr(parallel, "enable_fault_tolerance", False) or getattr(
         parallel, "use_ubatching", False
     ):
-        reasons.append("fault tolerance and ubatching unsupported")
+        issues.append(ConfigIssue(IssueCode.FAULT_TOLERANCE_OR_UBATCHING))
     if config.use_v2_model_runner or scheduler.async_scheduling:
-        reasons.append("V1 runner with --no-async-scheduling required")
+        issues.append(ConfigIssue(IssueCode.RUNNER_OR_SCHEDULING))
+    return issues
+
+
+def _model_issues(config):
+    model = config.model_config
+    issues = []
+
     if model.trust_remote_code:
-        reasons.append("remote model/tokenizer code must be disabled")
+        issues.append(ConfigIssue(IssueCode.REMOTE_CODE))
     if getattr(model, "enable_prompt_embeds", False):
-        reasons.append("prompt embeddings must be disabled on the reviewed runtime")
+        issues.append(ConfigIssue(IssueCode.PROMPT_EMBEDS))
     if getattr(model, "is_multimodal_model", False):
-        reasons.append("multimodal serving is outside the reviewed safety contract")
+        issues.append(ConfigIssue(IssueCode.MULTIMODAL))
     if getattr(
         getattr(config, "observability_config", None),
         "otlp_traces_endpoint",
         None,
     ):
-        reasons.append("OTLP tracing is outside the reviewed safety contract")
+        issues.append(ConfigIssue(IssueCode.OTLP_TRACING))
     if not model.enforce_eager or config.compilation_config.cudagraph_mode.name != "NONE":
-        reasons.append("--enforce-eager required")
+        issues.append(ConfigIssue(IssueCode.EAGER_EXECUTION))
     if getattr(config.compilation_config.mode, "value", config.compilation_config.mode) != 0:
-        reasons.append("compilation must be disabled")
+        issues.append(ConfigIssue(IssueCode.COMPILATION))
     if str(model.dtype) != "torch.bfloat16":
-        reasons.append("BF16 model configuration required")
+        issues.append(
+            ConfigIssue(
+                IssueCode.MODEL_DTYPE,
+                actual=str(model.dtype),
+                expected="torch.bfloat16",
+            )
+        )
+    return issues
+
+
+def _source_issues(config):
+    model = config.model_config
+    issues = []
 
     try:
         adapter = model_adapter(model.hf_config)
@@ -84,17 +117,33 @@ def validate_config(config):
             if initial not in adapter.formats:
                 raise ValueError(f"{initial} is not reviewed for {adapter.model_type}")
     except ValueError as exc:
-        reasons.append(str(exc))
+        issues.append(ConfigIssue(IssueCode.REPRESENTATION, detail=str(exc)))
     if getattr(model.hf_config, "quantization_config", None):
-        reasons.append("canonical checkpoint must be unquantized")
+        issues.append(ConfigIssue(IssueCode.QUANTIZED_CHECKPOINT))
     if not Path(model.model).is_dir():
-        reasons.append("an immutable local checkpoint directory is required")
+        issues.append(ConfigIssue(IssueCode.CHECKPOINT_DIRECTORY))
+    return issues
+
+
+def _mutation_issues(config):
+    parallel = config.parallel_config
+    model = config.model_config
+    scheduler = config.scheduler_config
+    cache = config.cache_config
+    issues = []
+
     if model.enable_sleep_mode or getattr(model, "enable_cumem_allocator", False):
-        reasons.append("sleep/CuMem allocator unsupported")
+        issues.append(ConfigIssue(IssueCode.ALLOCATOR_POOLS))
     if cache.cache_dtype not in ("auto", "bfloat16"):
-        reasons.append("BF16 KV required")
+        issues.append(
+            ConfigIssue(
+                IssueCode.KV_DTYPE,
+                actual=cache.cache_dtype,
+                expected=("auto", "bfloat16"),
+            )
+        )
     if scheduler.scheduler_cls is not None or parallel.worker_extension_cls:
-        reasons.append("custom schedulers/worker extensions unsupported")
+        issues.append(ConfigIssue(IssueCode.CUSTOM_RUNTIME))
     for name in (
         "speculative_config",
         "lora_config",
@@ -103,20 +152,55 @@ def validate_config(config):
         "weight_transfer_config",
     ):
         if getattr(config, name, None) is not None:
-            reasons.append(name + " unsupported")
+            issues.append(ConfigIssue(IssueCode.UNSUPPORTED_FEATURE, field=name))
     if getattr(getattr(config, "aux_output_config", None), "enabled", False):
-        reasons.append("auxiliary output connectors unsupported")
+        issues.append(ConfigIssue(IssueCode.AUX_OUTPUT))
     offload = getattr(config, "offload_config", None)
     if offload and (
         offload.uva.cpu_offload_gb or offload.prefetch.offload_group_size
     ):
-        reasons.append("weight offload unsupported")
+        issues.append(ConfigIssue(IssueCode.WEIGHT_OFFLOAD))
     if config.device_config.device_type != "cuda":
-        reasons.append("CUDA required")
-    if reasons:
-        raise ValueError(
-            "Unsupported dynamic quantization configuration: " + "; ".join(reasons)
+        issues.append(
+            ConfigIssue(
+                IssueCode.DEVICE,
+                actual=config.device_config.device_type,
+                expected="cuda",
+            )
         )
+    return issues
+
+
+def configuration_issues(config):
+    """Collect stable findings in the existing validation order."""
+    return tuple(
+        _execution_issues(config)
+        + _model_issues(config)
+        + _source_issues(config)
+        + _mutation_issues(config)
+    )
+
+
+def validate_config(config):
+    issues = configuration_issues(config)
+    if issues:
+        raise ValueError(
+            "Unsupported dynamic quantization configuration: "
+            + "; ".join(issue.message for issue in issues)
+        )
+
+
+@dataclass
+class ReplacementPreparation:
+    """Private owners retained from component preparation through publication."""
+
+    config: object
+    metadata_before: set[int]
+    mode: str
+    iterator: object = None
+    model: object = None
+    unit: object = None
+    validation: object = None
 
 
 class EngineBackend:
@@ -145,11 +229,9 @@ class EngineBackend:
         self.canonical_model_config = deepcopy(engine.vllm_config.model_config)
         self.source = str(self.verified_source.root)
         self.preparation = None
-        self.holder = {}
         self.saved_input_block = None
         self.serving_reserve_bytes = 0
         self.destructive_started = False
-        self.replacement_mode = None
         self.pause_lease = None
         from .lifecycle import DeadlineWakeup
         from vllm.v1.engine import EngineCoreRequestType
@@ -280,13 +362,13 @@ class EngineBackend:
         from .linearwise import replace_slices
 
         self.destructive_started = False
-        self.replacement_mode = "dirty" if dirty else "drain"
+        mode = "dirty" if dirty else "drain"
         cfg = self.candidate_config(target)
         plan_canary(self.runner.vllm_config, allow_bound=True)
         components = preflight(self, target, dirty)
         self.native_quantization_policy = native_policy(self, cfg, components)
-        self._begin_holder(cfg)
-        self.preparation = replace_slices(self, cfg, components, dirty)
+        self._begin_preparation(cfg, mode)
+        self.preparation.iterator = replace_slices(self, cfg, components, dirty)
         self.saved_input_block = self.engine.process_input_queue_block
         self.engine.process_input_queue_block = False
 
@@ -300,8 +382,8 @@ class EngineBackend:
                 return self.take_candidate()
 
     def advance_replacement(self):
-        result = next(self.preparation)
-        if self.replacement_mode == "dirty":
+        result = next(self.preparation.iterator)
+        if self.preparation.mode == "dirty":
             import torch
 
             if (
@@ -311,16 +393,20 @@ class EngineBackend:
                 raise ValueError("Insufficient serving headroom after replacement unit")
         return result
 
-    def _begin_holder(self, cfg):
+    def _begin_preparation(self, cfg, mode):
         from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
-        self.holder = {"config": cfg, "metadata_before": {id(layer) for layer in LAYERWISE_INFO}}
+        self.preparation = ReplacementPreparation(
+            config=cfg,
+            metadata_before={id(layer) for layer in LAYERWISE_INFO},
+            mode=mode,
+        )
 
     def take_candidate(self):
-        cfg, model = self.holder["config"], self.holder["model"]
-        self.validate_candidate(cfg, model)
-        self.preparation.close()
-        self.preparation = None
-        return cfg, model
+        preparation = self.preparation
+        self.validate_candidate(preparation.config, preparation.model)
+        preparation.iterator.close()
+        preparation.iterator = None
+        return preparation
 
     def validate_candidate(self, cfg, model):
         from vllm.model_executor.layers.attention import Attention
@@ -351,21 +437,20 @@ class EngineBackend:
 
     def precommit(self, candidate):
         import torch
-        if self.replacement_mode != "dirty":
+        if candidate.mode != "dirty":
             self.assert_drained()
-        cfg, model = candidate
-        if (self.holder.get("model") is not model or self.holder.get("config") is not cfg
-                or not self.holder.get("validation")):
+        if candidate is not self.preparation or not candidate.validation:
             raise ValueError("Candidate does not have owned successful validation")
         torch.cuda.synchronize()
-        if self.replacement_mode != "dirty" and not self.engine.reset_prefix_cache():
+        if candidate.mode != "dirty" and not self.engine.reset_prefix_cache():
             raise RuntimeError("Prefix cache reset refused")
 
     def commit(self, candidate):
         import torch
         from vllm.model_executor.layers.attention import Attention
 
-        candidate_config, candidate_model = candidate
+        candidate_config = candidate.config
+        candidate_model = candidate.model
         engine = self.engine
         runner = self.runner
         candidate_context = candidate_config.compilation_config.static_forward_context
@@ -399,10 +484,9 @@ class EngineBackend:
         engine.vllm_config.quant_config = candidate_config.quant_config
         engine.vllm_config.load_config = candidate_config.load_config
         torch.cuda.synchronize()
-        self.holder = {}
+        self.preparation = None
         del publication_references
         self.destructive_started = False
-        self.replacement_mode = None
 
     def recover_preparation(self):
         import torch
@@ -412,19 +496,22 @@ class EngineBackend:
         # A failed native quantizer may have queued work on another stream.
         # Establish device completion before dropping any private GPU owners.
         torch.cuda.synchronize()
-        if self.preparation is not None:
-            self.preparation.close()
-            self.preparation = None
+        preparation = self.preparation
+        if preparation is not None and preparation.iterator is not None:
+            preparation.iterator.close()
+            preparation.iterator = None
         from .layerwise import retire_block
         retained = {id(module) for module in self.runner.model.modules()}
         retired = []
-        private = self.holder.pop("unit", None)
+        private = None if preparation is None else preparation.unit
+        if preparation is not None:
+            preparation.unit = None
         if private is not None:
             if id(private) in retained:
                 raise RuntimeError("Recovery candidate is already serving")
             retired.extend(retire_block(private, retained))
         private = None
-        before = self.holder.get("metadata_before")
+        before = None if preparation is None else preparation.metadata_before
         if before is not None:
             for layer in list(LAYERWISE_INFO):
                 if id(layer) not in before:
@@ -435,12 +522,12 @@ class EngineBackend:
                     LOADING_LAYERS.discard(layer)
         # Do not keep the final private layer alive across collection/refreeze.
         layer = info = None
-        self.holder = {}
+        self.preparation = None
+        preparation = None
         torch.cuda.synchronize()
         collect_retired()
         if any(item() is not None for item in retired):
             raise RuntimeError("Private replacement unit still has module owners")
-        self.replacement_mode = None
 
     def resume(self):
         from vllm.v1.engine import EngineCoreRequestType
@@ -469,6 +556,7 @@ class EngineBackend:
         import torch
 
         source = getattr(self, "verified_source", None)
+        preparation = getattr(self, "preparation", None)
         process_id = os.getpid()
         return {
             "pid": process_id,
@@ -477,7 +565,7 @@ class EngineBackend:
             "source_protected": source.protected if source else None,
             "torch_allocated_bytes": torch.cuda.memory_allocated(),
             "torch_reserved_bytes": torch.cuda.memory_reserved(),
-            "replacement_mode": self.replacement_mode,
+            "replacement_mode": None if preparation is None else preparation.mode,
             "destructive_started": self.destructive_started,
             "running": len(self.engine.scheduler.running),
             "waiting": len(self.engine.scheduler.waiting),
