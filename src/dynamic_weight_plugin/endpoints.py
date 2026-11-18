@@ -174,7 +174,7 @@ async def _call_utility(registry, engine, method, *args):
         registry.unavailable = True
         raise HTTPException(
             503,
-            "Engine utility response was lost; inspect status before retrying",
+            "Engine utility response was lost; restart the API process before retrying",
         ) from exc
     if "control_error" in result:
         error = result["control_error"]
