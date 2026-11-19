@@ -258,13 +258,20 @@ class PackageSeamTests(unittest.TestCase):
 
     def test_verified_load_binds_model_source_before_native_load(self):
         events = []
+        runner = None
 
         class Snapshot:
             def __init__(self, path, require_protected=True):
                 events.append("snapshot")
 
             def check_content(self):
+                self.assert_not_bound()
                 events.append("content")
+
+            @staticmethod
+            def assert_not_bound():
+                if hasattr(runner, "_dynamic_weight_source"):
+                    raise AssertionError("source published before post-load content check")
 
         runner = SimpleNamespace(
             vllm_config=SimpleNamespace(
@@ -286,7 +293,8 @@ class PackageSeamTests(unittest.TestCase):
             patch("dynamic_weight_plugin.source.CheckpointSnapshot", Snapshot),
         ):
             self.assertEqual(wrapped(runner), "model")
-        self.assertLess(events.index("verify"), events.index("native"))
+        self.assertEqual(events, ["verify", "snapshot", "native", "content"])
+        self.assertIsInstance(runner._dynamic_weight_source, Snapshot)
 
         runner = SimpleNamespace(vllm_config=runner.vllm_config)
         events.clear()
@@ -300,6 +308,25 @@ class PackageSeamTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unreviewed model source"):
                 wrapped(runner)
         self.assertEqual(events, [])
+
+        runner = SimpleNamespace(vllm_config=runner.vllm_config)
+        events.clear()
+        with (
+            patch(
+                "dynamic_weight_plugin.models.verify_model_config_source",
+                side_effect=lambda config: events.append("verify"),
+            ),
+            patch("dynamic_weight_plugin.source.CheckpointSnapshot", Snapshot),
+            patch.object(
+                Snapshot,
+                "check_content",
+                side_effect=ValueError("checkpoint changed after native load"),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "changed after native load"):
+                wrapped(runner)
+        self.assertEqual(events, ["verify", "snapshot", "native"])
+        self.assertFalse(hasattr(runner, "_dynamic_weight_source"))
 
 
 class EndpointTests(unittest.IsolatedAsyncioTestCase):

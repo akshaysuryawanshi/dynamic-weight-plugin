@@ -218,7 +218,9 @@ class EngineBackend:
         self.verified_source = getattr(self.runner, "_dynamic_weight_source", None)
         if self.verified_source is None:
             raise ValueError("Native model load has no verified canonical source snapshot")
-        self.verified_source.check_content()
+        # Native load already completed the SHA256 pass. Admission only needs the
+        # snapshot's complete inventory and stat-identity check.
+        self.verified_source.check()
         quant = engine.vllm_config.model_config.quantization
         if quant == "bitsandbytes":
             from .compat import verify_bitsandbytes_runtime

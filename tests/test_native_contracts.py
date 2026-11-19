@@ -14,7 +14,11 @@ from dynamic_weight_plugin.component_policy import (
     inspect_policy,
     native_policy,
 )
-from dynamic_weight_plugin.adapter import configuration_issues, validate_config
+from dynamic_weight_plugin.adapter import (
+    EngineBackend,
+    configuration_issues,
+    validate_config,
+)
 from dynamic_weight_plugin.compat import runtime_profile
 from dynamic_weight_plugin.config_issues import ConfigIssueCode
 from dynamic_weight_plugin.control import ControlError
@@ -403,6 +407,62 @@ class NativeContractTests(unittest.TestCase):
             (root / "model.safetensors").write_bytes(b"changed")
             with self.assertRaises(ValueError):
                 snapshot.check_content()
+
+    def test_controller_admission_uses_snapshot_identity_without_rehashing(self):
+        class AdmissionReached(Exception):
+            pass
+
+        class Source:
+            def __init__(self):
+                self.checks = 0
+
+            def check(self):
+                self.checks += 1
+
+            def check_content(self):
+                raise AssertionError("controller admission must not rehash the checkpoint")
+
+        class Engine:
+            pass
+
+        class Executor:
+            pass
+
+        source = Source()
+        runner = SimpleNamespace(_dynamic_weight_source=source)
+        engine = Engine()
+        engine.vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(quantization=None)
+        )
+        engine.model_executor = Executor()
+        engine.model_executor.driver_worker = SimpleNamespace(
+            worker=SimpleNamespace(model_runner=runner)
+        )
+        patches = (
+            patch("vllm.v1.engine.core.EngineCoreProc", Engine),
+            patch("vllm.v1.executor.uniproc_executor.UniProcExecutor", Executor),
+            patch("dynamic_weight_plugin.adapter.validate_config"),
+            patch(
+                "dynamic_weight_plugin.adapter.initial_representation",
+                side_effect=AdmissionReached,
+            ),
+        )
+        with patches[0], patches[1], patches[2], patches[3]:
+            with self.assertRaises(AdmissionReached):
+                EngineBackend(engine)
+        self.assertEqual(source.checks, 1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
+            weights = root / "model.safetensors"
+            weights.write_bytes(b"weights")
+            snapshot = CheckpointSnapshot(root, require_protected=False)
+            weights.write_bytes(b"changed-weight-bytes")
+            with self.assertRaisesRegex(ValueError, "changed since content verification"):
+                runner._dynamic_weight_source = snapshot
+                with patches[0], patches[1], patches[2], patches[3]:
+                    EngineBackend(engine)
 
     def test_checkpoint_snapshot_rejects_symlinked_root(self):
         with tempfile.TemporaryDirectory() as directory:
