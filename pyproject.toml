@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dynamic-weight-plugin"
-version = "0.1.0a1"
+version = "0.1.0"
 description = "Live weight representation changes for vLLM"
 readme = "README.md"
 license = "MIT"

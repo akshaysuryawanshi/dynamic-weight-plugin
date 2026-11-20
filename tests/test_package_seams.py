@@ -189,7 +189,7 @@ class PackageSeamTests(unittest.TestCase):
     def test_entry_points_and_current_runtime_boundaries(self):
         project = Path(__file__).parents[1]
         data = tomllib.loads((project / "pyproject.toml").read_text())
-        self.assertEqual(dynamic_weight_plugin.__version__, "0.1.0a1")
+        self.assertEqual(dynamic_weight_plugin.__version__, "0.1.0")
         self.assertEqual(
             data["project"]["entry-points"]["vllm.general_plugins"][
                 "dynamic_weight"
